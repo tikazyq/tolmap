@@ -666,6 +666,10 @@ pub fn sandbox_exec(
     code
 }
 
+#[cfg(target_os = "linux")]
+#[path = "indexers_cleanup.rs"]
+mod cleanup;
+
 /// The jail: nsjail started by root, dropping straight to the worker's
 /// uid, with a tmpfs root, read-only system trees, the checkout at its own path
 /// and a network namespace whose only way out is the egress proxy.
@@ -1372,16 +1376,23 @@ direct.on('error', () => askProxy());
     /// Removes every `node_modules` the install created, so a fallback
     /// indexes exactly the checkout it would have without installs (a
     /// partial `node_modules` would give scip-typescript half a dependency
-    /// graph). `remove_dir_all` does not follow symlinks.
+    /// graph). Linux cleanup holds directory handles and skips replacements.
     pub(super) fn remove_new_node_modules(
         repo: &Path,
         before: &std::collections::BTreeSet<PathBuf>,
     ) -> usize {
-        node_modules_dirs(repo)
-            .into_iter()
-            .filter(|path| !before.contains(path))
-            .filter(|path| fs::remove_dir_all(path).is_ok())
-            .count()
+        #[cfg(target_os = "linux")]
+        {
+            super::cleanup::remove(repo, before)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            node_modules_dirs(repo)
+                .into_iter()
+                .filter(|path| !before.contains(path))
+                .filter(|path| fs::remove_dir_all(path).is_ok())
+                .count()
+        }
     }
 
     /// Package-manager output is the repository's text: control characters
