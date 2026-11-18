@@ -390,6 +390,7 @@ fn the_default_thresholds_fail_a_heavy_coupling_change_without_any_flag() {
     );
     assert_eq!(report["verdict"], "fail");
     assert_eq!(report["thresholds"]["source"], "default");
+    assert!(report.get("default_assessment").is_none());
     let run = check(&repo, &["--base", &base]);
     expect_code(&run, 1);
     assert!(
@@ -413,6 +414,20 @@ fn the_default_thresholds_fail_a_heavy_coupling_change_without_any_flag() {
         run.stdout.lines().nth(2).unwrap(),
         "verdict: pass (report only: --report-only)"
     );
+    assert!(run.stdout.contains("default thresholds would fail"));
+    let advisory = check(
+        &repo,
+        &["--base", &base, "--report-only", "--format", "json"],
+    );
+    expect_code(&advisory, 0);
+    let advisory = advisory.json();
+    assert_eq!(advisory["verdict"], "pass");
+    assert_eq!(advisory["default_assessment"]["verdict"], "fail");
+    assert_eq!(advisory["default_assessment"]["districts_margin"], 3);
+    let margin = advisory["default_assessment"]["delta_q_margin"]
+        .as_f64()
+        .unwrap();
+    assert!((margin - (report["delta_q"].as_f64().unwrap() + 0.0001)).abs() < 1e-9);
     // A flag the change stays inside replaces both defaults: pass.
     let run = check(&repo, &["--base", &base, "--max-dq", "1"]);
     expect_code(&run, 0);
@@ -882,4 +897,98 @@ fn polyglot_scope_and_stored_map_include_typescript_or_explain_its_omission() {
         args.extend(invalid);
         expect_code(&check(&repo, &args), 2);
     }
+}
+
+#[test]
+fn registered_checks_use_the_indexed_map_and_linked_worktree() {
+    let (dir, repo, base) = fixture();
+    let data = dir.path().join("library");
+    let run = |cwd: &Path, args: &[&str]| {
+        Command::new(TOLMAP)
+            .current_dir(cwd)
+            .env("TOLMAP_REFS", "hand")
+            .env("TOLMAP_SCIP_INSTALL", "off")
+            .arg("--data")
+            .arg(&data)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let added = run(
+        &repo,
+        &[
+            "add",
+            ".",
+            "--name",
+            "owner/town",
+            "--pkg",
+            ".",
+            "--lang",
+            "py",
+        ],
+    );
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let linked = dir.path().join("linked");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            &base,
+        ],
+    );
+    touch(&linked, "billing", 0);
+    let args = [
+        "check",
+        "--repo",
+        "owner/town",
+        "--report-only",
+        "--format",
+        "json",
+    ];
+    let output = run(&linked, &args);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["base"], base);
+    assert!(report["head"].is_null());
+    assert_eq!(
+        file_entry(&report, "town/billing/invoice.py")["status"],
+        "modified"
+    );
+    assert_eq!(report["default_assessment"]["verdict"], "pass");
+
+    // A remote registration has the same retained artifacts but no checkout.
+    // Use the local publication to exercise this branch without network access.
+    let db = rusqlite::Connection::open(data.join("tolmap.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE repositories SET kind='github', location='github.com/owner/town'",
+        [],
+    )
+    .unwrap();
+    let missing = run(&linked, &args);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("pass --head SHA"));
+    let invalid = run(&linked, &[&args[..], &["--head", "unavailable"]].concat());
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("missing from retained source"));
+    let output = run(&linked, &[&args[..], &["--head", &base]].concat());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["head"], base);
+    assert_eq!(report["default_assessment"]["districts_margin"], 4);
+    assert_eq!(report["default_assessment"]["delta_q_margin"], 0.0001);
 }

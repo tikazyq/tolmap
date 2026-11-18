@@ -692,6 +692,7 @@ fn compact(
         }
     }
     let coverage = CoverageReport {
+        excluded_test_files: layout.weighted.excluded_test_files,
         zero_edge_files,
         total_files: layout.weighted.nodes.len(),
         by_language,

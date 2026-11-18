@@ -1386,6 +1386,7 @@ mod tests {
             semantic: 0.0,
         };
         GraphData {
+            excluded_test_files: None,
             entry_points: BTreeMap::new(),
             repo: "outlier".to_owned(),
             pkg: ".".to_owned(),
@@ -1499,6 +1500,7 @@ mod tests {
     #[test]
     fn mass_normalization_assigns_each_signal_its_share() {
         let mut data = GraphData {
+            excluded_test_files: None,
             entry_points: BTreeMap::new(),
             repo: String::new(),
             pkg: String::new(),

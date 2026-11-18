@@ -32,4 +32,4 @@ build_output_mirror?: number,
  * omitted rather than written as `0`, so every such map stays
  * byte-identical.
  */
-python_cross_project?: number, };
+python_cross_project?: number, excluded_test_files?: number | null, };

@@ -79,6 +79,12 @@ requires the snapshot's immutable commit and uses the existing bounded Git-blob
 reader. Missing source remains explicit. Individual snapshot deletion and the
 organization view are not offered by the personal adapter.
 
+The map's `F` table counts indexed files. `coverage.excluded_test_files`, when
+present, counts distinct source files skipped by test-directory and filename
+filters within the selected roots. Zero is a measured count. A missing field
+means the count is unknown, including for older snapshots. See the overview
+contract in [QUERY.md](QUERY.md#query-and-result-shapes) for the displayed rule.
+
 | Comparison route | Result |
 |---|---|
 | `GET /api/compare/{owner}/{id}?base=SHA&head=SHA` | `Comparison` for two full commit IDs, with optional `max_districts`, `max_dq` and `report_only`. `{owner}/{id}` is `snapshot/{snapshot_id}` or `personal/{repository_id}`. |
@@ -90,7 +96,10 @@ by exact full commit ID; otherwise the route returns 404 `comparison_unavailable
 and no newer snapshot is substituted. Lens and debt comparison also require a
 retained head snapshot. A malformed commit ID is 400. Head source is read from the
 retained Git objects, and comparisons are cached under the library cache
-directory (`comparisons/`).
+directory (`comparisons/`). With `report_only`, the embedded `CheckReport`
+includes `default_assessment` with the advisory verdict and signed margins for
+the default thresholds. The report's primary verdict follows the applied
+thresholds. See [CHECK.md](CHECK.md#json-schema-and-version-policy).
 
 Home/history poll every two seconds during indexing or queueing, otherwise every
 30 seconds. Active job views poll every two seconds while visible.

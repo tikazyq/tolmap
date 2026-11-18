@@ -37,7 +37,11 @@ using `/`; they are not filesystem paths relative to the current directory.
 is a candidate; `query.ambiguous` is true when there is more than one, even if
 the limit hides all but one. Use a returned qualified name (and inspect line
 ranges if that still names several definitions). No candidate is selected for
-the caller.
+the caller. If neither a file nor a symbol matches a path-shaped query, `where`
+suggests up to three mapped paths ranked by edit distance over the full path,
+then lexicographically. A slash, backslash or filename extension makes a query
+path-shaped. A query containing `::` is treated as qualified symbol syntax
+after exact file lookup.
 
 Only a symbol lookup reads the map's `<stem>.symbols.json` sibling, when present.
 A registered personal snapshot uses its retained
@@ -96,7 +100,9 @@ one trailing newline. Paths and district names replace all internal indices.
   symbol candidates set `symbol` to
   `{"name":...,"qualified_name":...,"start":...,"end":...}`.
   Line ranges are the stored one-based inclusive ranges. Symbol candidates sort
-  by path, start line, qualified name, then end line.
+  by path, start line, qualified name, then end line. A path-shaped miss has
+  `query.path_suggestions`, an ordered array that can be empty. It keeps
+  `total: 0` and suggestions do not count toward `--limit`.
 - **deps**: `query` has `path`, `direction` (`in`, `out`, `both`), and
   `directions:{"in":counts|null,"out":counts|null}`. Each requested direction has
   `counts:{"total":N,"returned":N,"omitted":N}`; an unrequested direction is
@@ -106,7 +112,11 @@ one trailing newline. Paths and district names replace all internal indices.
   `{"kind":"dependency","path":...,"district":...,"direction":"in|out"}`,
   sorted by path then direction (`in` first).
 - **overview**: `query` includes `files`, `imports` (map edge rows), `districts`,
-  and `language` (the map's language label). Rows are
+  and `language` (the map's language label). `files` counts mapped files and
+  leaves out test files skipped by source collection. `excluded_test_files`
+  counts distinct skipped test files within selected source roots, or is `null`
+  if the map has no measurement. `test_exclusion_rule` describes the extractor's
+  directory and filename rules. Rows are
   `{"kind":"district","name":...,"files":N,"imports_in":N,"imports_out":N}`.
   Counts describe cross-district imports only; internal imports are excluded.
   Rows sort by descending file count, then name, with stored district order
@@ -207,10 +217,11 @@ Refresh reuses a complete snapshot for the same commit and source selection;
 changed source selections may retain repeated commits. Source objects are independent of the original checkout and clone cache.
 No existing stores are discovered or imported.
 
-Refresh excludes dirty and untracked content; check without `--head` compares
-against the local working tree including those changes. In database mode,
-`--commit` selects check's base snapshot and `--base`, if given, must agree.
-Remote checks require an explicit `--head` available in retained source.
+Refresh excludes dirty and untracked content. A check of a local registration
+without `--head` includes those changes in the current linked worktree or the
+registered checkout. `--commit` or `--snapshot` selects the base snapshot.
+Remote registrations require `--head SHA` available in retained source.
+See [CHECK.md](CHECK.md) for the check options and output.
 Explicit `check PATH --base REV [--base-map FILE]` stays available (`--map`
 is an alias for `--base-map`). Query/check/debt exit contracts and thresholds
 remain unchanged. Source-oriented `build`, `detect` and lens commands also

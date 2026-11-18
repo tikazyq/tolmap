@@ -62,6 +62,20 @@ pub struct Snapshot {
     path: PathBuf,
 }
 
+fn edit_distance(a: &str, b: &str) -> usize {
+    let mut row: Vec<_> = (0..=b.chars().count()).collect();
+    for (i, a) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, b) in b.chars().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (diagonal + usize::from(a != b)).min(1 + row[j].min(above));
+            diagonal = above;
+        }
+    }
+    row[row.len() - 1]
+}
+
 impl Snapshot {
     pub fn load(path: &Path) -> Result<Self> {
         let path = if path.is_dir() {
@@ -187,6 +201,7 @@ impl Snapshot {
                 Query::Where {
                     target: target.into(),
                     ambiguous: false,
+                    path_suggestions: None,
                 },
                 limit,
                 vec![QueryResult::File {
@@ -284,6 +299,21 @@ impl Snapshot {
                 .then(x.end.cmp(&y.end))
         });
         let ambiguous = hits.len() > 1;
+        // Qualified symbol misses are symbol queries. A path-like simple
+        // symbol still wins over a spelling suggestion if it matched above.
+        let path_suggestions = (hits.is_empty()
+            && !target.contains("::")
+            && (target.contains(['/', '\\']) || Path::new(target).extension().is_some()))
+        .then(|| {
+            let mut closest = BTreeSet::new();
+            for path in &self.map.files {
+                closest.insert((edit_distance(target, path), path));
+                if closest.len() > 3 {
+                    closest.pop_last();
+                }
+            }
+            closest.into_iter().map(|(_, path)| path.clone()).collect()
+        });
         let results = hits
             .into_iter()
             .map(|(file, symbol)| QueryResult::File {
@@ -296,6 +326,7 @@ impl Snapshot {
             Query::Where {
                 target: target.into(),
                 ambiguous,
+                path_suggestions,
             },
             limit,
             results,
@@ -339,6 +370,12 @@ impl Snapshot {
                 imports: self.map.edges.len(),
                 districts: self.map.districts.len(),
                 language: self.map.lang.clone(),
+                excluded_test_files: self
+                    .map
+                    .coverage
+                    .as_ref()
+                    .and_then(|coverage| coverage.excluded_test_files),
+                test_exclusion_rule: Some(crate::extract::TEST_EXCLUSION_RULE.into()),
             },
             limit,
             results,
@@ -550,14 +587,33 @@ pub fn text(report: &QueryResponse) -> String {
     }
     match &report.query {
         Query::Status {} => {}
+        Query::Where {
+            target,
+            path_suggestions: Some(paths),
+            ..
+        } => {
+            out.push_str(&format!("no mapped file matches {target:?}\n"));
+            if !paths.is_empty() {
+                out.push_str(&format!("nearest mapped paths: {}\n", paths.join(", ")));
+            }
+        }
         Query::Overview {
             files,
             imports,
             districts,
             language,
-        } => out.push_str(&format!(
-            "{files} files, {imports} imports, {districts} districts, language {language}\n"
-        )),
+            excluded_test_files,
+            test_exclusion_rule,
+        } => {
+            out.push_str(&format!(
+                "{files} files, {imports} imports, {districts} districts, language {language}\n"
+            ));
+            let count =
+                excluded_test_files.map_or_else(|| "unknown".into(), |count| count.to_string());
+            if let Some(rule) = test_exclusion_rule {
+                out.push_str(&format!("test files excluded: {count} ({rule})\n"));
+            }
+        }
         Query::Route { edge_kind, .. } => out.push_str(&format!(
             "file import path ({edge_kind:?}); not a runtime call chain\n"
         )),

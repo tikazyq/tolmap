@@ -150,6 +150,8 @@ pub struct CoverageReport {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub python_cross_project: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_test_files: Option<usize>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -519,7 +521,17 @@ pub struct CheckReport {
     pub landmark_touches: Vec<CheckLandmark>,
     pub thresholds: CheckThresholds,
     pub verdict: CheckVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_assessment: Option<CheckDefaultAssessment>,
     pub lower_bound: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, TS, PartialEq)]
+pub struct CheckDefaultAssessment {
+    pub verdict: CheckVerdict,
+    #[ts(type = "number")]
+    pub districts_margin: i64,
+    pub delta_q_margin: f64,
 }
 
 // A changed file absent from both graphs. `not_in_scope` includes files
@@ -693,6 +705,8 @@ pub struct RustModTree {
 
 #[derive(Clone, Debug)]
 pub struct GraphData {
+    // Measurement from source discovery, independent of graph construction.
+    pub excluded_test_files: Option<usize>,
     pub repo: String,
     pub pkg: String,
     pub lang: String,
@@ -762,6 +776,8 @@ pub struct GraphData {
 #[derive(Deserialize)]
 struct GraphDataWire {
     #[serde(default)]
+    excluded_test_files: Option<usize>,
+    #[serde(default)]
     entry_points: BTreeMap<String, String>,
     repo: String,
     pkg: String,
@@ -821,13 +837,13 @@ impl Serialize for GraphData {
     where
         S: Serializer,
     {
-        // Keep the derived serializer's established field order so
-        // `tolmap dump-graph` remains byte-identical.
+        // Keep the established field order for dumps without new measurements.
         let fields = 10
             + if self.references.is_some() { 1 } else { 0 }
             + if self.build_output_mirror != 0 { 1 } else { 0 }
             + usize::from(self.python_cross_project != 0)
-            + usize::from(!self.entry_points.is_empty());
+            + usize::from(!self.entry_points.is_empty())
+            + usize::from(self.excluded_test_files.is_some());
         let mut state = serializer.serialize_struct("GraphData", fields)?;
         state.serialize_field("repo", &self.repo)?;
         state.serialize_field("pkg", &self.pkg)?;
@@ -850,6 +866,9 @@ impl Serialize for GraphData {
         }
         if !self.entry_points.is_empty() {
             state.serialize_field("entry_points", &self.entry_points)?;
+        }
+        if let Some(count) = self.excluded_test_files {
+            state.serialize_field("excluded_test_files", &count)?;
         }
         state.end()
     }
@@ -900,6 +919,7 @@ impl<'de> Deserialize<'de> for GraphData {
             .collect::<Result<Vec<_>, D::Error>>()?;
         drop(file_ids);
         Ok(Self {
+            excluded_test_files: wire.excluded_test_files,
             entry_points: wire.entry_points,
             repo: wire.repo,
             pkg: wire.pkg,
@@ -967,6 +987,7 @@ mod tests {
     #[test]
     fn graph_data_keeps_path_based_json_with_indexed_edges() {
         let data = GraphData {
+            excluded_test_files: None,
             entry_points: BTreeMap::new(),
             repo: "fixture".to_owned(),
             pkg: ".".to_owned(),
@@ -1037,6 +1058,7 @@ mod tests {
     #[test]
     fn graph_data_keeps_a_nonzero_build_output_mirror_count() {
         let data = GraphData {
+            excluded_test_files: None,
             entry_points: BTreeMap::new(),
             repo: "fixture".to_owned(),
             pkg: ".".to_owned(),
@@ -1072,6 +1094,7 @@ mod tests {
     #[test]
     fn a_nonzero_python_cross_project_count_is_written_and_round_trips() {
         let data = GraphData {
+            excluded_test_files: None,
             entry_points: BTreeMap::new(),
             repo: "fixture".to_owned(),
             pkg: ".".to_owned(),
@@ -1100,6 +1123,7 @@ mod tests {
         assert_eq!(round_trip.python_cross_project, 3);
 
         let coverage = |count| CoverageReport {
+            excluded_test_files: None,
             zero_edge_files: 0,
             total_files: 0,
             by_language: BTreeMap::new(),

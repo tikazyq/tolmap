@@ -54,9 +54,9 @@ use crate::geometry::{self, BuildFeatures};
 use crate::naming::{self, NamerKind};
 use crate::pipeline::{self, PruneVariant};
 use crate::schema::{
-    CheckDistrict, CheckEdge, CheckEdgeCause, CheckFile, CheckFileStatus, CheckLandmark,
-    CheckOutsideGraph, CheckReport, CheckThresholdSource, CheckThresholds, CheckVerdict, GraphData,
-    MapDocument, NodeRow,
+    CheckDefaultAssessment, CheckDistrict, CheckEdge, CheckEdgeCause, CheckFile, CheckFileStatus,
+    CheckLandmark, CheckOutsideGraph, CheckReport, CheckThresholdSource, CheckThresholds,
+    CheckVerdict, GraphData, MapDocument, NodeRow,
 };
 
 /// `CheckReport::version`. Bumped on any change to a field's meaning or
@@ -209,8 +209,14 @@ pub fn exit_code(report: &CheckReport) -> i32 {
 /// ("text" or "json") on stdout and anything else on stderr, and returns
 /// the process exit code. A panic is an internal error (3), not Rust's 101,
 /// so a consumer only ever sees the four documented codes.
-pub fn run_cli(options: &CheckOptions, format: &str) -> i32 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(options)));
+pub fn run_cli(
+    options: &CheckOptions,
+    format: &str,
+    snapshot: Option<&crate::service::store::PersonalSnapshot>,
+) -> i32 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_with_snapshot(options, snapshot)
+    }));
     match outcome {
         Ok(Ok(report)) => {
             let rendered = if format == "json" {
@@ -246,6 +252,13 @@ pub fn render_json(report: &CheckReport) -> String {
 }
 
 pub fn run(options: &CheckOptions) -> Result<CheckReport, CheckError> {
+    run_with_snapshot(options, None)
+}
+
+fn run_with_snapshot(
+    options: &CheckOptions,
+    snapshot: Option<&crate::service::store::PersonalSnapshot>,
+) -> Result<CheckReport, CheckError> {
     let started = Instant::now();
     let thresholds = resolve_thresholds(options)?;
     let top = if options.head.is_some()
@@ -265,11 +278,19 @@ pub fn run(options: &CheckOptions) -> Result<CheckReport, CheckError> {
         .transpose()?;
     // Before any expensive work: a stored map that is missing, unreadable or
     // from another commit is an input error the caller can fix.
-    let supplied_map = options
-        .base_map
-        .as_deref()
-        .map(|path| load_base_map(path, &base))
-        .transpose()?;
+    let supplied_map = if let Some(snapshot) = snapshot {
+        Some(load_base_map(
+            &snapshot.map_path,
+            &base,
+            Some(&snapshot.commit),
+        )?)
+    } else {
+        options
+            .base_map
+            .as_deref()
+            .map(|path| load_base_map(path, &base, None))
+            .transpose()?
+    };
     let changes = diff(&top, &base, head.as_deref())?;
 
     let mut scratch = Scratch::new(&top)?;
@@ -821,6 +842,19 @@ fn compare(
         .max_districts
         .is_some_and(|max| districts_crossed > max)
         || thresholds.max_dq.is_some_and(|max| delta_q < -max);
+    let default_assessment = (thresholds.source == CheckThresholdSource::ReportOnly).then(|| {
+        let districts_margin = DEFAULT_MAX_DISTRICTS as i64 - districts_crossed as i64;
+        let delta_q_margin = round(delta_q + DEFAULT_MAX_DQ);
+        CheckDefaultAssessment {
+            verdict: if districts_margin < 0 || delta_q_margin < 0.0 {
+                CheckVerdict::Fail
+            } else {
+                CheckVerdict::Pass
+            },
+            districts_margin,
+            delta_q_margin,
+        }
+    });
     Ok(CheckReport {
         version: REPORT_VERSION,
         base,
@@ -844,6 +878,7 @@ fn compare(
         } else {
             CheckVerdict::Pass
         },
+        default_assessment,
         lower_bound: true,
     })
 }
@@ -971,6 +1006,17 @@ pub fn render_text(report: &CheckReport) -> String {
         report.delta_q, report.modularity_base, report.modularity_head
     );
     let _ = writeln!(out, "verdict: {}", verdict_line(report));
+    if let Some(assessment) = &report.default_assessment {
+        let verdict = match assessment.verdict {
+            CheckVerdict::Pass => "pass",
+            CheckVerdict::Fail => "fail",
+        };
+        let _ = writeln!(
+            out,
+            "default thresholds would {verdict} (margin to limit: {:+} districts at {DEFAULT_MAX_DISTRICTS}, {:+.6} delta q at -{DEFAULT_MAX_DQ:.6})",
+            assessment.districts_margin, assessment.delta_q_margin,
+        );
+    }
 
     let _ = writeln!(
         out,
@@ -1163,29 +1209,36 @@ fn is_object_id(value: &str) -> bool {
 /// Reads `--base-map` and verifies the commit it records equals `base`. The
 /// map document itself carries no commit (docs/ARCHITECTURE.md: the
 /// compact schema has no commit field); the service store records it in the
-/// file name, `<cache_dir>/maps/<owner>/<repo>/<commit>.json`, and so does
-/// this check: a map whose file name is not `<full commit id>.json` cannot
-/// be verified and is refused rather than trusted.
-fn load_base_map(path: &Path, base: &str) -> Result<MapDocument, CheckError> {
-    let raw = std::fs::read(path)
-        .map_err(|error| input(format!("--base-map {}: {error}", path.display())))?;
-    let document: MapDocument = serde_json::from_slice(&raw).map_err(|error| {
+/// file name, `<cache_dir>/maps/<owner>/<repo>/<commit>.json`. Personal
+/// snapshots instead carry the expected commit in their registry entry.
+fn load_base_map(
+    path: &Path,
+    base: &str,
+    registry_commit: Option<&str>,
+) -> Result<MapDocument, CheckError> {
+    if path.is_dir() {
+        return Err(input(format!(
+            "--base-map {}: expected a map file",
+            path.display()
+        )));
+    }
+    let snapshot = crate::query::Snapshot::load(path)
+        .map_err(|error| input(format!("base map {}: {error:#}", path.display())))?;
+    // Personal snapshots are published as map.json. Their commit is in the
+    // registry entry that supplies the path, even when absent from the map.
+    let recorded = snapshot.identity.commit.as_deref().or(registry_commit).ok_or_else(|| {
         input(format!(
-            "--base-map {} is not a tolmap map: {error}",
+            "--base-map {}: cannot verify its commit; use a retained snapshot or name it <full commit id>.json",
             path.display()
         ))
     })?;
-    let recorded = crate::query::Snapshot::load(path)
-        .map_err(|error|input(format!("--base-map {}: {error:#}",path.display())))?
-        .identity.commit
-        .ok_or_else(||input(format!("--base-map {}: cannot verify its commit; use a retained snapshot or name it <full commit id>.json",path.display())))?;
     if recorded != base {
         return Err(input(format!(
             "--base-map {} was built from {recorded}, not --base {base}",
             path.display()
         )));
     }
-    Ok(document)
+    Ok(snapshot.map)
 }
 
 /// `git diff --name-status -M` between base and head, following renames;

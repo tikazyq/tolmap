@@ -793,6 +793,7 @@ fn build_selected_sources(
         .then(|| module_index(repo))
         .transpose()?;
 
+    let mut excluded_tests = selected.is_none().then(BTreeSet::new);
     let mut intermediates = Vec::with_capacity(sorted_sources.len());
     let mut spool = collect_symbols
         .then(crate::symbols::SymbolSpool::new)
@@ -802,17 +803,12 @@ fn build_selected_sources(
         // RefsMode and InstallMode are consumed later, after raw parsing and
         // source resolution, by apply_scip_references; they cannot affect
         // these records and therefore stay out of their provenance keys.
-        let (parsed, raw, collection_time, steps) = match selected {
-            Some(files) => parse_selected_files(
-                repo,
-                pkg,
-                *language,
-                files[language.as_str()].clone(),
-                spool.as_mut(),
-                progress,
-            )?,
-            None => parse_files_inner(repo, pkg, *language, spool.as_mut(), progress)?,
+        let files = match selected {
+            Some(files) => files[language.as_str()].clone(),
+            None => source_files_inner(repo, pkg, *language, &mut excluded_tests)?,
         };
+        let (parsed, raw, collection_time, steps) =
+            parse_selected_files(repo, pkg, *language, files, spool.as_mut(), progress)?;
         symbol_collection += collection_time;
         collect_steps.add(&steps);
         let graph_started = Instant::now();
@@ -889,6 +885,15 @@ fn build_selected_sources(
     let graph_started = Instant::now();
     let mut graph = finish_graph(repo, merged, history, progress)?;
     graph.references = references;
+    graph.excluded_test_files = excluded_tests.map(|tests| {
+        // Another selected root may index a path skipped by its parent root.
+        tests.len()
+            - graph
+                .nodes
+                .iter()
+                .filter(|node| tests.contains(&node.file))
+                .count()
+    });
     progress.log(format!("index_work {}", serde_json::json!({"files":graph.nodes.len(), "graph_edges":graph.edges.len(), "resolved_import_pairs":graph.imports.len()})));
     graph_time += graph_started.elapsed();
     let total = started.elapsed();
@@ -954,30 +959,16 @@ fn parse_files(
     pkg: &str,
     language: LanguageKind,
 ) -> Result<(BTreeMap<String, ParsedFile>, BTreeMap<String, FileRaw>)> {
-    let (parsed, raw, _, _) = parse_files_inner(
+    let files = source_files(repo, pkg, language)?;
+    let (parsed, raw, _, _) = parse_selected_files(
         repo,
         pkg,
         language,
+        files,
         None,
         &crate::progress::Progress::silent(),
     )?;
     Ok((parsed, raw))
-}
-
-fn parse_files_inner(
-    repo: &Path,
-    pkg: &str,
-    language: LanguageKind,
-    spool: Option<&mut crate::symbols::SymbolSpool>,
-    progress: &crate::progress::Progress,
-) -> Result<(
-    BTreeMap<String, ParsedFile>,
-    BTreeMap<String, FileRaw>,
-    Duration,
-    crate::symbols::CollectTimings,
-)> {
-    let files = source_files(repo, pkg, language)?;
-    parse_selected_files(repo, pkg, language, files, spool, progress)
 }
 
 fn parse_selected_files(
@@ -1962,6 +1953,17 @@ fn install_typescript_dependencies(
 // than a second file-matching implementation keeps the detector's file
 // counts identical to what `build` would actually index.
 pub(crate) fn source_files(repo: &Path, pkg: &str, language: LanguageKind) -> Result<Vec<String>> {
+    source_files_inner(repo, pkg, language, &mut None)
+}
+
+pub(crate) const TEST_EXCLUSION_RULE: &str = "Source collection skips test directories named test, tests or testdata, and __tests__ for Go, Rust and TypeScript. It also skips Go *_test.go and TypeScript .ts/.tsx names containing .test. or .spec.";
+
+fn source_files_inner(
+    repo: &Path,
+    pkg: &str,
+    language: LanguageKind,
+    excluded_tests: &mut Option<BTreeSet<String>>,
+) -> Result<Vec<String>> {
     let root = repo.join(pkg);
     ensure!(
         root.is_dir(),
@@ -1969,7 +1971,7 @@ pub(crate) fn source_files(repo: &Path, pkg: &str, language: LanguageKind) -> Re
         root.display()
     );
     let mut result = Vec::new();
-    collect_source_files(repo, &root, language, &mut result)?;
+    collect_source_files(repo, &root, language, &mut result, excluded_tests, false)?;
     result.sort();
     Ok(result)
 }
@@ -1979,7 +1981,12 @@ fn collect_source_files(
     directory: &Path,
     language: LanguageKind,
     result: &mut Vec<String>,
+    excluded_tests: &mut Option<BTreeSet<String>>,
+    in_test_dir: bool,
 ) -> Result<()> {
+    if in_test_dir && excluded_tests.is_none() {
+        return Ok(());
+    }
     let mut entries = fs::read_dir(directory)
         .with_context(|| format!("read directory {}", directory.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1997,7 +2004,14 @@ fn collect_source_files(
                 LanguageKind::Rust => rust::skip_dir(&name),
             };
             if !skip {
-                collect_source_files(repo, &path, language, result)?;
+                collect_source_files(repo, &path, language, result, excluded_tests, in_test_dir)?;
+            } else if excluded_tests.is_some()
+                && matches!(name.as_str(), "tests" | "test" | "testdata" | "__tests__")
+                && collect_source_files(repo, &path, language, result, excluded_tests, true)
+                    .is_err()
+            {
+                // An excluded directory need not be readable for extraction.
+                *excluded_tests = None;
             }
             continue;
         }
@@ -2006,7 +2020,7 @@ fn collect_source_files(
         }
         let accepted = match language {
             LanguageKind::Python => name.ends_with(".py"),
-            LanguageKind::Go => name.ends_with(".go") && !name.ends_with("_test.go"),
+            LanguageKind::Go => name.ends_with(".go"),
             LanguageKind::Rust => name.ends_with(".rs"),
             LanguageKind::TypeScript => {
                 // `.tsx` alongside `.ts`: the import resolver
@@ -2017,14 +2031,22 @@ fn collect_source_files(
                 // dropped (issue #35). `.d.tsx` is not a real declaration
                 // suffix (`.d.ts` is TypeScript-only syntax), so no matching
                 // exclusion is added for it.
-                (name.ends_with(".ts") || name.ends_with(".tsx"))
-                    && !name.ends_with(".d.ts")
-                    && !name.contains(".test.")
-                    && !name.contains(".spec.")
+                (name.ends_with(".ts") || name.ends_with(".tsx")) && !name.ends_with(".d.ts")
             }
         };
         if accepted {
-            result.push(relative_slash(repo, &path)?);
+            let test_name = match language {
+                LanguageKind::Go => name.ends_with("_test.go"),
+                LanguageKind::TypeScript => name.contains(".test.") || name.contains(".spec."),
+                _ => false,
+            };
+            if in_test_dir || test_name {
+                if let Some(tests) = excluded_tests {
+                    tests.insert(relative_slash(repo, &path)?);
+                }
+            } else {
+                result.push(relative_slash(repo, &path)?);
+            }
         }
     }
     Ok(())
@@ -6866,6 +6888,7 @@ fn finish_graph(
 
     let entry_points = crate::entry_points::detect(repo, &nodes);
     Ok(GraphData {
+        excluded_test_files: None,
         entry_points,
         repo: repo
             .file_name()
@@ -9924,8 +9947,25 @@ mod tests {
             "src/legacy.d.ts",
             "export declare const x: number;\n",
         );
-        let files = source_files(dir.path(), "src", LanguageKind::TypeScript).unwrap();
+        write(
+            dir.path(),
+            "src/__tests__/helper.ts",
+            "export const fixture = 1;\n",
+        );
+        write(dir.path(), "src/vendor/Foo.test.tsx", "");
+        write(dir.path(), "src/__tests__/vendor/Foo.test.tsx", "");
+        let mut excluded = Some(BTreeSet::new());
+        let files =
+            source_files_inner(dir.path(), "src", LanguageKind::TypeScript, &mut excluded).unwrap();
         assert_eq!(files, vec!["src/Foo.tsx".to_owned()]);
+        assert_eq!(
+            excluded.unwrap(),
+            BTreeSet::from([
+                "src/Foo.spec.tsx".to_owned(),
+                "src/Foo.test.tsx".to_owned(),
+                "src/__tests__/helper.ts".to_owned(),
+            ])
+        );
     }
 
     #[test]

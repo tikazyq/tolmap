@@ -78,6 +78,8 @@ pub enum Query {
     Where {
         target: String,
         ambiguous: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path_suggestions: Option<Vec<String>>,
     },
     Deps {
         path: String,
@@ -89,6 +91,10 @@ pub enum Query {
         imports: usize,
         districts: usize,
         language: String,
+        #[serde(default)]
+        excluded_test_files: Option<usize>,
+        #[serde(default)]
+        test_exclusion_rule: Option<String>,
     },
     Route {
         from: String,

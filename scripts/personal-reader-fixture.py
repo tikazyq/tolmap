@@ -10,6 +10,8 @@ git('init');git('config','user.name','Fixture');git('config','user.email','fixtu
 (repo/'shop/perf.py').write_text('def measured():\n    return 7\n' + '# performance fixture line 739\n'*30000 + '# PERF_NEEDLE_739\n')
 (repo/'long.txt').write_text('x'*21000)
 (repo/'shop/perf_long.py').write_text('LONG = \"'+'x'*900000+'PERF_NEEDLE_739\"\n')
+(repo/'shop/tests').mkdir()
+(repo/'shop/tests/test_cart.py').write_text('def test_cart(): pass\n')
 (repo/'inert.txt').write_text('<script>window.sourceInjected=true</script>\n')
 (repo/'escape').symlink_to('/etc/passwd')
 git('add','.');git('commit','-m','A');a=git('rev-parse','HEAD')
@@ -78,6 +80,8 @@ SYMBOLS_ALLOWED=SYMBOLS_REQUIRED|{'symbol_rings','module_rings','header_rings'}
 assert set(original)==SOURCE_FIELDS,original
 assert set(provenance)=={'version','repository','commit'},provenance
 assert MAP_REQUIRED<=set(export)<=MAP_ALLOWED,set(export)
+assert export['coverage']['excluded_test_files']==1,export['coverage']
+assert 'shop/tests/test_cart.py' not in export['F']
 host_paths=(str(pathlib.Path.cwd().resolve()),str(root),str(repo))
 source_lines=[line.strip() for line in committed_source.splitlines() if len(line.strip())>=16 and ' ' in line.strip()]
 def private_safe(label,value):

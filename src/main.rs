@@ -1134,7 +1134,7 @@ fn main() -> Result<()> {
                 head.as_deref(),
                 data,
             );
-            let (repo, base, base_map) = match resolved {
+            let resolved = match resolved {
                 Ok(v) => v,
                 Err(error) => {
                     eprintln!("{error:#}");
@@ -1142,10 +1142,10 @@ fn main() -> Result<()> {
                 }
             };
             let options = tolmap::check::CheckOptions {
-                repo,
-                base,
+                repo: resolved.repo,
+                base: resolved.base,
                 head,
-                base_map,
+                base_map: resolved.base_map,
                 pkg,
                 lang,
                 all_sources,
@@ -1155,7 +1155,11 @@ fn main() -> Result<()> {
             };
             // Not `?`: the exit code is the contract (0/1/2/3), and
             // `main`'s own error path would exit 1 for every failure.
-            std::process::exit(tolmap::check::run_cli(&options, &format));
+            std::process::exit(tolmap::check::run_cli(
+                &options,
+                &format,
+                resolved.snapshot.as_ref(),
+            ));
         }
         Command::PolyglotReport {
             repo,

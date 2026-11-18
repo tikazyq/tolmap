@@ -66,8 +66,11 @@ tolmap route src/main.rs src/schema.rs --map "$MAP"
 ```
 
 `overview` lists districts, not entry landmarks; use manifests/source to discover
-entry paths. Paths are exact repository-relative paths, with `/`. JSON is the default;
-`--format text` is for people. `deps` is direct adjacency, not transitive impact.
+entry paths. Its file count excludes tests skipped during source collection.
+Read `query.excluded_test_files` and `query.test_exclusion_rule`. Older maps
+show an unknown count. Paths are exact repository-relative paths, with `/`.
+A path-shaped `where` miss offers `query.path_suggestions` from the map.
+JSON is the default. `--format text` is for people. `deps` is direct adjacency, not transitive impact.
 `route` is an **import path**, potentially reversed or undirected as its
 `edge_kind` reports, not a runtime call chain. An empty result is not evidence
 that no runtime relationship exists.
@@ -99,8 +102,14 @@ Read changed files, districts, edges, `lower_bound` and `outside_graph` together
 an empty mapped impact does not make those changes safe or irrelevant.
 `--all-sources` uses detection's scope floor; explicit paired `--pkg`/`--lang`
 can select sources when needed. Keep pilot checks advisory (`--report-only`).
-Exit 0 means a valid advisory report, not absence of risk; 2/3 mean input/internal
-failure. Compact queries also return 0 for no match, so read `total`.
+Read `default_assessment` for the verdict under default thresholds and the
+margin to each limit. Negative margins exceed the limit. A successful advisory
+report exits 0. Exit 2 or 3 means input or internal failure, respectively.
+For a registered check use `--repo NAME`, optionally with `--commit SHA` or
+`--snapshot ID` to pick the indexed base. Local registrations can use the
+current linked worktree. Remote registrations need `--head SHA` available in
+retained source. From a local worktree, `check . --base REV` works independently
+of the registry. Compact queries also return 0 for no match, so read `total`.
 
 ## Pick debt with evidence
 

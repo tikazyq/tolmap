@@ -20,7 +20,7 @@ tolmap check <repo> --base <ref> [--head <ref>] [--base-map <map.json>]
 | `--pkg PATH`, `--lang LANG` | build-style source selection (`py`, `go`, `rs`, `ts`). Repeat both equally and pair positionally. With one flag, detect the omitted language or root on base |
 | `--max-districts N` | fail (exit 1) when the change crosses more than `N` districts |
 | `--max-dq X` | fail (exit 1) when modularity drops by more than `X`, that is when `delta_q < -X`. `X` is a number ≥ 0 |
-| `--report-only` | apply no threshold: report, and exit 0 whatever the numbers. Cannot be combined with `--max-districts` or `--max-dq` (exit 2) |
+| `--report-only` | Show whether the defaults would pass and by how much. A successful report exits 0. Combining this with `--max-districts` or `--max-dq` exits 2. |
 | `--format text\|json` | `text` (the default) or `json` on stdout. Progress and timings go to stderr |
 
 ## Default thresholds
@@ -28,7 +28,7 @@ tolmap check <repo> --base <ref> [--head <ref>] [--base-map <map.json>]
 **With no threshold flag the check applies `--max-districts 4 --max-dq 0.0001`.** Both are absolute: neither scales with the size of the repository.
 
 - **Flags replace the defaults as a set.** Pass either threshold flag and only the flags you pass apply. `--max-dq 0.002` alone checks Δq and nothing else; no default mixes in.
-- **`--report-only` applies none.** That is the behaviour the check had before the defaults existed.
+- **`--report-only` applies none.** `default_assessment` says whether the defaults would pass and gives the margin to each limit.
 - **The report says which applied.** `thresholds.source` is `default`, `flags` or `report_only`.
 
 The defaults come from replaying 600 real commits through the check on GitHub Actions: the last 200 first-parent commits of django, prometheus and vuejs/core at their corpus pins (`remote-build.yml` `command=check-calibrate`). `--max-districts` is from docs/FINDINGS.md finding 60. `--max-dq` was recalibrated in finding 61, after co-change was held at the base (see "Co-change is the base's on both sides" below). On those commits the two together fail 10, 2 and 7 of the 200 (5%, 1% and 3.5%).
@@ -121,11 +121,12 @@ Any other name exits 2 rather than trusting an unverified map. A map from the se
 | `landmark_touches` | `{file, kind, detail}[]` | `kind` is `hazard` or `bridge` |
 | `thresholds` | `{max_districts, max_dq, source}` | the thresholds applied, `null` where one was not applied. `source` is `default` (no threshold flag), `flags` (the flags given, and only those) or `report_only` (both `null`) |
 | `verdict` | `"pass" \| "fail"` | `fail` exactly when the exit code is 1 |
+| `default_assessment` | `{verdict, districts_margin, delta_q_margin}` | Present with `--report-only`. `districts_margin = 4 - districts_crossed` and `delta_q_margin = delta_q + 0.0001`, rounded to six decimal places. A positive margin is room to spare, zero is exactly at the limit, and any negative margin makes this advisory `verdict` fail. |
 | `lower_bound` | `true` | always |
 
 ## Text format
 
-The text format starts with three lines: districts crossed, Δq and the verdict. Then comes the edge list: added (`+`) and removed (`−`) cross-district edges merged, heaviest first, with at most 20 shown. Then come context lines for unplaced files and touched landmarks, and last the lower-bound note. JSON lists every edge.
+The text format starts with three lines: districts crossed, Δq and the verdict. In report-only mode, a fourth line gives the advisory default verdict and both signed margins. Then comes the edge list: added (`+`) and removed (`−`) cross-district edges merged, heaviest first, with at most 20 shown. Then come context lines for unplaced files and touched landmarks, and last the lower-bound note. JSON lists every edge.
 
 ## Polyglot scope example
 
@@ -149,7 +150,7 @@ Both examples are real output, not illustrations. They come from GitHub Actions 
 
 Three things in them are worth reading closely:
 
-- **It fails on both thresholds.** Thirty commits together cross 6 districts, past the default 4. Of the 600 single commits replayed for finding 60, 4 crossed 6 or more. Δq is −0.000174, past the default 0.0001. With `--report-only` the numbers are the same, the verdict is `pass` and the exit code is 0.
+- **It fails on both thresholds.** Thirty commits together cross 6 districts, past the default 4. Of the 600 single commits replayed for finding 60, 4 crossed 6 or more. Δq is −0.000174, past the default 0.0001. With `--report-only`, `default_assessment` reports `fail` with margins of −2 districts and −0.000074 Δq. The command exits 0.
 - **The drop is two imports.** `core/validators.py` now imports `utils/deprecation.py` and `utils/warnings.py`, from district 2 into district 0. Before co-change was held at the base (finding 61), the same diff read +0.000162, with four more edges listed (one added, three removed) that carried no import and moved only because the head read the 30 commits' own history. Those four are gone.
 - **Not every listed edge touches a changed file.** `sql/query.py -> utils/warnings.py` left the pruned graph although neither file changed. Pruning keeps each file's strongest edges relative to its others (finding 23), so a new edge elsewhere can push an old one out. The edge lists describe the graph the partitioner sees, not only the diff's own lines.
 
@@ -384,9 +385,13 @@ tolmap check --repo engine --report-only
 tolmap check --repo engine --commit <retained-base-sha> --head <available-head-sha> --report-only
 ```
 
-`--commit` selects the stored base snapshot; `--base`, when supplied, must agree.
-Without `--head`, local registrations compare the working tree including dirty
-files. Remote registrations require explicit retained source and `--head`.
-Explicit path and `--base-map` inputs remain available. Thresholds and exit
-meanings are unchanged. Comparison HTTP endpoints are retired; protected
-embedders can still call the comparison library with their opt-in access policy.
+By default the latest complete snapshot supplies the base. Use `--commit SHA`
+or `--snapshot ID` to select a retained base. If given, `--base` must resolve to
+that same commit. The registry records the commit for its saved `map.json`.
+
+Without `--head`, a local registration compares the current checkout if it is
+in the same Git worktree family. From elsewhere it uses the registered
+checkout. This includes staged, unstaged and untracked files. A remote
+registration requires `--head SHA` available in the selected snapshot's retained
+source. To compare a local worktree when using a remote registration, run
+`tolmap check PATH --base REV --report-only`, optionally with `--base-map FILE`.

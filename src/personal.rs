@@ -714,6 +714,13 @@ mod tests {
     }
 }
 
+pub struct ResolvedCheck {
+    pub repo: PathBuf,
+    pub base: String,
+    pub base_map: Option<PathBuf>,
+    pub snapshot: Option<PersonalSnapshot>,
+}
+
 /// Resolve a check's base through the same registry as read-only queries.
 /// Explicit checkout + base retains the independent build/check workflow.
 #[allow(clippy::too_many_arguments)]
@@ -726,55 +733,89 @@ pub fn resolve_check(
     map: Option<PathBuf>,
     head: Option<&str>,
     data: Option<&Path>,
-) -> Result<(PathBuf, String, Option<PathBuf>)> {
+) -> Result<ResolvedCheck> {
     if let Some(checkout) = checkout_path {
         ensure!(
             name.is_none() && commit.is_none() && snapshot_id.is_none(),
             "explicit checkout conflicts with snapshot selectors"
         );
-        return Ok((
-            checkout,
-            base.context("explicit checkout requires --base")?,
-            map,
-        ));
+        return Ok(ResolvedCheck {
+            repo: checkout,
+            base: base.context("explicit checkout requires --base")?,
+            base_map: map,
+            snapshot: None,
+        });
     }
     if let Some(map) = map {
         ensure!(
             name.is_none() && commit.is_none() && snapshot_id.is_none(),
             "--map conflicts with snapshot selectors"
         );
-        return Ok((
-            std::env::current_dir()?,
-            base.context("--map requires --base")?,
-            Some(map),
-        ));
+        return Ok(ResolvedCheck {
+            repo: std::env::current_dir()?,
+            base: base.context("--map requires --base")?,
+            base_map: Some(map),
+            snapshot: None,
+        });
     }
     let library = Library::open(data)?;
     let repo = library.resolve(name)?;
-    let snapshot = library.snapshot(&repo, commit, snapshot_id)?;
+    let snapshot = library.snapshot(&repo, commit, snapshot_id).with_context(|| {
+        format!("cannot select an indexed base for {}; pass --commit SHA or --snapshot ID for a retained base, or check PATH --base REV", repo.name)
+    })?;
+    ensure!(snapshot.map_path.is_file(), "snapshot {} has no map file; pass --commit SHA or --snapshot ID for another retained base, or check PATH --base REV", snapshot.id);
     let path = if repo.kind == "local" {
+        let registered = PathBuf::from(&repo.location);
         ensure!(
-            Path::new(&repo.location).is_dir(),
-            "checkout {} is missing",
-            repo.location
+            registered.is_dir(),
+            "registered checkout {} is missing; pass a checkout path and --base REV",
+            registered.display()
         );
-        PathBuf::from(&repo.location)
+        let common_dir = |path: &Path| {
+            git(
+                path,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+        };
+        let cwd = std::env::current_dir()?;
+        if let Ok(current) = checkout(&cwd) {
+            if current != registered
+                && common_dir(&registered)
+                    .ok()
+                    .zip(common_dir(&current).ok())
+                    .is_some_and(|(a, b)| a == b)
+            {
+                current
+            } else {
+                registered
+            }
+        } else {
+            registered
+        }
     } else {
-        let head = head.context("remote-only check requires --head and retained source")?;
-        ensure!(snapshot.source_path.is_dir(), "snapshot source is missing");
-        // check creates temporary detached worktrees from this retained bare source.
+        let head = head.context("remote registration has no working tree; pass --head SHA available in retained source, or check PATH --base REV to use your worktree")?;
+        ensure!(snapshot.source_path.is_dir(), "snapshot {} has no retained source; pass --commit SHA or --snapshot ID for another retained base, or check PATH --base REV", snapshot.id);
         ensure!(!head.starts_with('-'), "invalid --head");
+        git(&snapshot.source_path, &["rev-parse", "--verify", "--end-of-options", &format!("{head}^{{commit}}")]).with_context(|| {
+            format!("head {head:?} is missing from retained source for {}; pass --head SHA available there, or check PATH --base REV to use your worktree", repo.name)
+        })?;
         snapshot.source_path.clone()
     };
     if let Some(base) = base {
-        let resolved = git(&path, &["rev-parse", &format!("{base}^{{commit}}")])?;
+        let resolved = git(&path, &["rev-parse", "--verify", "--end-of-options", &format!("{base}^{{commit}}")])
+            .with_context(|| format!("--base {base:?} is missing from the selected source; pass --base {} or omit --base", snapshot.commit))?;
         ensure!(
             resolved == snapshot.commit,
             "--base must agree with the selected snapshot ({})",
             snapshot.commit
         );
     }
-    Ok((path, snapshot.commit, Some(snapshot.map_path)))
+    Ok(ResolvedCheck {
+        repo: path,
+        base: snapshot.commit.clone(),
+        base_map: None,
+        snapshot: Some(snapshot),
+    })
 }
 
 /// Detached view of retained objects for build/detect. Its lifetime owns cleanup.

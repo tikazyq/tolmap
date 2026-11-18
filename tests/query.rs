@@ -333,7 +333,7 @@ fn hierarchical_symbols_and_unknown_coverage() {
     let map = temp.path().join("flask.json");
     std::fs::write(&map, include_bytes!("../data/flask.json")).unwrap();
     let symbols = serde_json::json!({
-        "files": [0], "symbols": [[0,"App",0,1,20,-1,5,false], [0,"run",1,2,5,0,3,false], [0,"run",1,22,25,-1,3,false]],
+        "files": [0], "symbols": [[0,"App",0,1,20,-1,5,false], [0,"run",1,2,5,0,3,false], [0,"run",1,22,25,-1,3,false], [0,"path.like",1,26,28,-1,2,false]],
         "edges": [], "module_code_lines": {},
         "coverage": {"calls_total": 7, "calls_resolved": 3, "unresolved": {"dynamic": 4}}
     });
@@ -363,6 +363,18 @@ fn hierarchical_symbols_and_unknown_coverage() {
         .coverage
         .calls_total
         .is_none());
+    let path_like = s.where_is("path.like", 8).unwrap();
+    assert_eq!(path_like.total, 1);
+    assert!(matches!(
+        path_like.query,
+        Query::Where {
+            path_suggestions: None,
+            ..
+        }
+    ));
+    assert!(
+        matches!(&path_like.results[..], [QueryResult::File { symbol: Some(symbol), .. }] if symbol.name == "path.like")
+    );
     let mut malformed = symbols;
     malformed["symbols"][0][5] = serde_json::json!(1);
     std::fs::write(
@@ -376,4 +388,53 @@ fn hierarchical_symbols_and_unknown_coverage() {
         .to_string()
         .contains("cycle"));
     assert_eq!(s.where_is(&s.map.files[0], 8).unwrap().total, 1);
+}
+
+#[test]
+fn path_misses_suggest_nearest_files_in_stable_order() {
+    let mut s = fixture("flask");
+    for (index, path) in s.map.files.iter_mut().enumerate() {
+        *path = format!("unrelated/directory/path-{index}.py");
+    }
+    s.map.files[..4].clone_from_slice(&[
+        "sample/b.rs".into(),
+        "sample/a.rs".into(),
+        "sample/zz.rs".into(),
+        "sample/zzz.rs".into(),
+    ]);
+    let report = s.where_is("sample/c.rs", 0).unwrap();
+    assert_eq!(report.total, 0);
+    assert!(!report.truncated);
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        json["query"]["path_suggestions"],
+        serde_json::json!(["sample/a.rs", "sample/b.rs", "sample/zz.rs"])
+    );
+    let text = tolmap::query::text(&report);
+    assert!(text.contains("no mapped file matches \"sample/c.rs\""));
+    assert!(text.contains("nearest mapped paths: sample/a.rs, sample/b.rs, sample/zz.rs"));
+    let plain = s.where_is("no-such-symbol", 0).unwrap();
+    assert!(serde_json::to_value(plain).unwrap()["query"]
+        .get("path_suggestions")
+        .is_none());
+}
+
+#[test]
+fn overview_discloses_exclusions_for_measured_and_legacy_maps() {
+    let mut s = fixture("flask");
+    s.map.coverage = None;
+    let report = s.overview(0);
+    assert!(serde_json::to_value(&report).unwrap()["query"]["excluded_test_files"].is_null());
+    assert!(tolmap::query::text(&report).contains("test files excluded: unknown"));
+    s.map.coverage = Some(serde_json::from_value(serde_json::json!({
+        "zero_edge_files": 0, "total_files": s.map.files.len(), "by_language": {}, "excluded_test_files": 3,
+    })).unwrap());
+    let report = s.overview(0);
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["query"]["excluded_test_files"], 3);
+    assert!(json["query"]["test_exclusion_rule"]
+        .as_str()
+        .unwrap()
+        .contains("*_test.go"));
+    assert!(tolmap::query::text(&report).contains("test files excluded: 3"));
 }
