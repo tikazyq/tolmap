@@ -12,7 +12,7 @@ import type { MisplacedFile } from "./MisplacedFile";
 import type { UndeclaredRustFile } from "./UndeclaredRustFile";
 import type { UnreachedFile } from "./UnreachedFile";
 
-export type DebtReport = { version: number, cycle_evidence: CycleEvidence, repo: string, partition?: DebtPartition | null,
+export type DebtReport = { version: number, cycle_evidence: CycleEvidence, repo: string, partition?: DebtPartition | null, 
 /**
  * Counts before the selected CLI filters are applied.
  */

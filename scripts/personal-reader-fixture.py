@@ -124,9 +124,9 @@ assert get(base_for(bid)+'/freshness')['state']=='failed'
 (repo/'shop/cart.py').write_text(committed_source+'\n# cancellation C\n')
 git('add','.');git('commit','-m','C')
 job=post('/api/repositories/'+repository_id+'/refresh')['job_id']
-def worker_pids():
+def stop_worker():
     # Only this web process's descendants; other CI jobs may index concurrently.
-    pending=[p.pid];seen=set();result=[]
+    pending=[p.pid];seen=set()
     while pending:
         parent=pending.pop()
         try:children_files=list(pathlib.Path(f'/proc/{parent}/task').glob('*/children'))
@@ -139,20 +139,25 @@ def worker_pids():
                 seen.add(child);pending.append(child)
                 try:
                     args=pathlib.Path(f'/proc/{child}/cmdline').read_bytes().split(b'\0')
-                    if len(args)>1 and args[1]==b'worker':result.append(child)
-                except (OSError,ProcessLookupError):pass
-    return result
+                except OSError:continue
+                if len(args)<=1 or args[1]!=b'worker':continue
+                # Forked helpers can briefly retain the worker's command line.
+                # The executor makes the actual worker a process-group leader.
+                try:
+                    if os.getpgid(child)!=child:continue
+                    os.killpg(child,signal.SIGSTOP)
+                except ProcessLookupError:continue
+                return child
+    return None
 for _ in range(1000):
-    workers=worker_pids()
-    if workers:
-        for worker in workers:os.killpg(worker,signal.SIGSTOP)
-        break
+    worker=stop_worker()
+    if worker is not None:break
     assert get('/api/jobs/'+job)['status'] not in ('done','failed'),'worker finished before cancellation qualification'
     time.sleep(.01)
 else:raise AssertionError('actual indexing worker was never observed')
 post('/api/jobs/'+job+'/cancel')
 for _ in range(300):
-    if not any(pathlib.Path('/proc/'+str(pid)).exists() for pid in workers):break
+    if not pathlib.Path(f'/proc/{worker}').exists():break
     time.sleep(.05)
 else:raise AssertionError('cancelled worker was not reaped')
 assert get(history_path)['snapshots'][0]['id']==bid
