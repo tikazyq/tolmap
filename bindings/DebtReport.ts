@@ -2,6 +2,7 @@
 import type { CoverageReport } from "./CoverageReport";
 import type { CycleEvidence } from "./CycleEvidence";
 import type { DebtFilters } from "./DebtFilters";
+import type { DebtPartition } from "./DebtPartition";
 import type { DebtThresholds } from "./DebtThresholds";
 import type { DistrictCycle } from "./DistrictCycle";
 import type { GodFile } from "./GodFile";
@@ -11,7 +12,7 @@ import type { MisplacedFile } from "./MisplacedFile";
 import type { UndeclaredRustFile } from "./UndeclaredRustFile";
 import type { UnreachedFile } from "./UnreachedFile";
 
-export type DebtReport = { version: number, cycle_evidence: CycleEvidence, repo: string, 
+export type DebtReport = { version: number, cycle_evidence: CycleEvidence, repo: string, names: { [key in string]: string }, partition_from?: DebtPartition | null,
 /**
  * Counts before the selected CLI filters are applied.
  */

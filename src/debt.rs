@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use ts_rs::TS;
 
-pub const DEBT_REPORT_VERSION: u32 = 7;
+pub const DEBT_REPORT_VERSION: u32 = 8;
 
 // ---- thresholds ------------------------------------------------------------
 
@@ -291,12 +291,24 @@ pub enum CycleEvidence {
     Full,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+pub struct DebtPartition {
+    pub base_map_sha256: String,
+    pub base_commit: Option<String>,
+    pub placed_new_files: usize,
+    pub unplaced_new_files: usize,
+    pub unplaced_paths: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct DebtReport {
     pub version: u32,
     pub cycle_evidence: CycleEvidence,
     pub repo: String,
+    pub names: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_from: Option<DebtPartition>,
     /// Counts before the selected CLI filters are applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unfiltered_counts: Option<BTreeMap<String, usize>>,
@@ -608,7 +620,7 @@ fn has_cycle(graph: &BTreeMap<String, BTreeSet<String>>) -> bool {
         .any(|node| !visited.contains(node) && visit(node, graph, &mut visiting, &mut visited))
 }
 
-fn cycles(map: &MapDocument) -> Vec<DistrictCycle> {
+fn cycles(map: &MapDocument, unplaced_district: Option<usize>) -> Vec<DistrictCycle> {
     let package_roots = map.debt.as_ref().and_then(|debt| {
         debt.package_roots.as_ref().map(|roots| {
             roots
@@ -632,7 +644,13 @@ fn cycles(map: &MapDocument) -> Vec<DistrictCycle> {
     let mut graph: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     for &[a, b] in &map.edges {
         let (from, to) = (collapsed[a], collapsed[b]);
-        if from == to {
+        // Unplaced files cannot supply district-level evidence, including a
+        // generated binding whose edge would otherwise collapse onto a generator.
+        if from == to
+            || [a, b, from, to]
+                .iter()
+                .any(|&file| Some(district(file)) == unplaced_district)
+        {
             continue;
         }
         let (from_district, to_district) = (district(from), district(to));
@@ -760,7 +778,78 @@ fn cycles(map: &MapDocument) -> Vec<DistrictCycle> {
     cycles
 }
 
+/// Relabel head files against the base partition without changing either map.
+/// Stored maps retain directed edges, not blended weights, so every retained
+/// outgoing edge contributes one unit to check's placement rule. Only inherited
+/// files are targets: new files never bootstrap one another's placement.
+pub fn pinned_findings(
+    head: &MapDocument,
+    base: &MapDocument,
+    base_map_sha256: String,
+    base_commit: Option<String>,
+) -> (MapDocument, DebtReport) {
+    let membership = base
+        .files
+        .iter()
+        .zip(&base.nodes)
+        .map(|(path, node)| (path.as_str(), node.district()))
+        .collect::<BTreeMap<_, _>>();
+    let inherited = head
+        .files
+        .iter()
+        .map(|path| membership.get(path.as_str()).copied())
+        .collect::<Vec<_>>();
+    let mut weights = vec![BTreeMap::<usize, f64>::new(); head.files.len()];
+    for &[from, to] in &head.edges {
+        if let (None, Some(district)) = (inherited[from], inherited[to]) {
+            *weights[from].entry(district).or_default() += 1.0;
+        }
+    }
+    let unplaced_district = base
+        .nodes
+        .iter()
+        .map(|node| node.district())
+        .max()
+        .map_or(0, |id| id + 1);
+    let mut map = head.clone();
+    map.names = base.names.clone();
+    let mut placed_new_files = 0;
+    let mut unplaced_paths = Vec::new();
+    for (file, node) in map.nodes.iter_mut().enumerate() {
+        node.0 .0 = inherited[file].unwrap_or_else(|| {
+            if let Some(district) = crate::check::place(&weights[file]) {
+                placed_new_files += 1;
+                district
+            } else {
+                unplaced_paths.push(map.files[file].clone());
+                unplaced_district
+            }
+        });
+    }
+    unplaced_paths.sort();
+    if !unplaced_paths.is_empty() {
+        map.names
+            .insert(unplaced_district.to_string(), "(unplaced)".into());
+    }
+    let mut report = findings_in_partition(
+        &map,
+        (!unplaced_paths.is_empty()).then_some(unplaced_district),
+    );
+    report.partition_from = Some(DebtPartition {
+        base_map_sha256,
+        base_commit,
+        placed_new_files,
+        unplaced_new_files: unplaced_paths.len(),
+        unplaced_paths,
+    });
+    (map, report)
+}
+
 pub fn findings(map: &MapDocument) -> DebtReport {
+    findings_in_partition(map, None)
+}
+
+fn findings_in_partition(map: &MapDocument, unplaced_district: Option<usize>) -> DebtReport {
     let n = map.files.len();
     let district = |f: usize| map.nodes[f].district();
     let file_edges = map
@@ -1108,6 +1197,8 @@ pub fn findings(map: &MapDocument) -> DebtReport {
         version: DEBT_REPORT_VERSION,
         cycle_evidence: CycleEvidence::Full,
         repo: map.repo.clone(),
+        names: map.names.clone(),
+        partition_from: None,
         unfiltered_counts: None,
         filters: None,
         filtered_counts: None,
@@ -1139,7 +1230,7 @@ pub fn findings(map: &MapDocument) -> DebtReport {
             entry_stem_suffixes: strings(ENTRY_STEM_SUFFIXES),
         },
         coverage: map.coverage.clone(),
-        cycles: cycles(map),
+        cycles: cycles(map, unplaced_district),
         misplaced,
         god_files,
         hotspots,
@@ -1555,6 +1646,19 @@ fn render_text_with_files(report: &DebtReport, files: Option<&[String]>) -> Stri
     use std::fmt::Write;
     let t = &report.thresholds;
     let mut out = String::new();
+    if let Some(partition) = &report.partition_from {
+        let _ = writeln!(
+            out,
+            "partition from: sha256 {} (commit {}); {} new files placed, {} unplaced",
+            partition.base_map_sha256,
+            partition.base_commit.as_deref().unwrap_or("unknown"),
+            partition.placed_new_files,
+            partition.unplaced_new_files,
+        );
+        for path in &partition.unplaced_paths {
+            let _ = writeln!(out, "  (unplaced) {path}");
+        }
+    }
     if let Some(filters) = &report.filters {
         let _ = writeln!(
             out,
@@ -1916,6 +2020,27 @@ pub fn run_filtered(
     top: Option<usize>,
     cycle_evidence: CycleEvidence,
 ) -> i32 {
+    run_partitioned(
+        (map, None),
+        format,
+        kinds,
+        path,
+        district,
+        top,
+        cycle_evidence,
+    )
+}
+
+pub fn run_partitioned(
+    maps: (&std::path::Path, Option<&std::path::Path>),
+    format: &str,
+    kinds: &[String],
+    path: Option<&str>,
+    district: Option<&str>,
+    top: Option<usize>,
+    cycle_evidence: CycleEvidence,
+) -> i32 {
+    let (map, partition_from) = maps;
     let bytes = match std::fs::read(map) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1930,7 +2055,19 @@ pub fn run_filtered(
             return 2;
         }
     };
-    let mut report = findings(&doc);
+    let (doc, mut report) = if let Some(base_path) = partition_from {
+        let base = match crate::query::Snapshot::load(base_path) {
+            Ok(base) => base,
+            Err(error) => {
+                eprintln!("tolmap debt: {}: {error:#}", base_path.display());
+                return 2;
+            }
+        };
+        pinned_findings(&doc, &base.map, base.identity.sha256, base.identity.commit)
+    } else {
+        let report = findings(&doc);
+        (doc, report)
+    };
     apply_filters(&mut report, &doc, kinds, path, district, top);
     if format != "lens" && cycle_evidence == CycleEvidence::Compact {
         compact_cycles(&mut report);
@@ -1942,6 +2079,16 @@ pub fn run_filtered(
                 "# applied filters: kinds={:?}, path={:?}, district={:?}, top={:?}\n",
                 kinds, path, district, top
             );
+            if let Some(partition) = &report.partition_from {
+                text.push_str(&format!(
+                    "# partition from: sha256 {} (commit {}); {} new files placed, {} unplaced: {:?}\n",
+                    partition.base_map_sha256,
+                    partition.base_commit.as_deref().unwrap_or("unknown"),
+                    partition.placed_new_files,
+                    partition.unplaced_new_files,
+                    partition.unplaced_paths,
+                ));
+            }
             text.push_str(&to_lens(&report, &doc).to_toml());
             text
         }
@@ -2053,6 +2200,14 @@ pub fn run_diff(before_path: &std::path::Path, after_path: &std::path::Path) -> 
     if before.filters.is_some() || after.filters.is_some() {
         eprintln!(
             "tolmap debt diff: filtered reports cannot be compared; provide unfiltered reports"
+        );
+        return 2;
+    }
+    if before.partition_from.as_ref().map(|p| &p.base_map_sha256)
+        != after.partition_from.as_ref().map(|p| &p.base_map_sha256)
+    {
+        eprintln!(
+            "tolmap debt diff: reports must both be unpinned or pinned to the same base map sha256"
         );
         return 2;
     }

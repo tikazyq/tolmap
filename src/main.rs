@@ -302,6 +302,9 @@ enum Command {
         snapshot: Option<String>,
         #[arg(long, default_value = "text", value_parser = ["text", "json", "lens"])]
         format: String,
+        /// Hold district membership and names fixed to this base map.
+        #[arg(long)]
+        partition_from: Option<PathBuf>,
         /// Keep only these finding kinds (repeatable).
         #[arg(long, value_parser = ["cycle", "misplaced", "god", "hotspot", "unreached", "undeclared-rust", "hidden-coupling"])]
         kind: Vec<String>,
@@ -991,6 +994,7 @@ fn main() -> Result<()> {
         Command::Debt {
             command,
             map,
+            partition_from,
             repo,
             commit,
             snapshot,
@@ -1012,8 +1016,8 @@ fn main() -> Result<()> {
                     snapshot.as_deref(),
                     data,
                 ) {
-                    Ok(map) => tolmap::debt::run_filtered(
-                        &map,
+                    Ok(map) => tolmap::debt::run_partitioned(
+                        (&map, partition_from.as_deref()),
                         &format,
                         &kind,
                         path.as_deref(),

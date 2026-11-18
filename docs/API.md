@@ -141,7 +141,7 @@ to suggest is not written, and a message on stderr says why (a map with no
 Exit 0, or 2 when the map cannot be read or a file cannot be written.
 `data/lenses/flask-suggest/` holds the suggestions for the pinned flask fixture.
 
-### `tolmap debt --map <map.json> [--format text|json|lens] [--kind <kind>...] [--path <prefix-or-glob>] [--district <name>] [--top <n>] [--cycle-evidence compact|full]`
+### `tolmap debt --map <map.json> [--partition-from <base-map.json>] [--format text|json|lens] [--kind <kind>...] [--path <prefix-or-glob>] [--district <name>] [--top <n>] [--cycle-evidence compact|full]`
 
 `--kind` is repeatable and accepts `cycle`, `misplaced`, `god`, `hotspot`,
 `unreached`, `undeclared-rust` or `hidden-coupling` (the CLI spellings of the
@@ -154,13 +154,34 @@ text, JSON and lens TOML;
 all outputs identify the selections (lens TOML uses a leading comment, which is
 valid TOML and ignored by `tolmap lens check`). Filtered JSON keeps the normal
 DebtReport version and lower-bound evidence, with additive `unfiltered_counts`,
-`filtered_counts` and `filters` fields. DebtReport is now v7: `cycle_evidence` is
+`filtered_counts` and `filters` fields. DebtReport is now v8: `names` records the
+report's district names and optional `partition_from` identifies a pinned report.
+`cycle_evidence` is
 `compact` by default for CLI text/JSON. Compact cycles retain member districts,
 `cross_edges`, one `route` and its `closing_edges`, package names and measurement
 flags. Their `package_edges`, `mutual_pairs` and `cut` arrays are empty;
 `cycle_evidence` distinguishes omitted evidence from measured empty bundles.
 `--cycle-evidence full` restores those bundles. Lens output always uses full
 evidence because its areas and notes depend on bundles.
+
+`--partition-from <base-map.json>` holds the base map's district membership and
+names fixed while computing debt from the selected head map (`--map`, or
+`--repo` with `--commit`/`--snapshot`). Matching is by path: surviving files keep
+their base district, and deleted files are absent. Each new file is placed by
+`check`'s plurality rule, ties going to the lowest district id. Maps retain no
+blended edge weights, so each retained outgoing `E` edge to an inherited base
+file contributes one unit; incoming edges and edges to other new files do not
+place it. A new file with no such edge joins the named `(unplaced)` district.
+Unplaced files may have file-level findings but never contribute district-cycle
+evidence. Extraction, partitioning, layout and the input maps are unchanged.
+Pinning a map to itself preserves its ordinary findings.
+
+Pinned reports include `partition_from: {base_map_sha256, base_commit,
+placed_new_files, unplaced_new_files, unplaced_paths}`. The SHA-256 identifies the
+base map's exact bytes; `base_commit` comes from stored commit metadata or its
+full-commit filename when known, otherwise null. Paths are sorted. Ordinary
+reports omit `partition_from`. Text and lens comments also identify the pinned
+base and new-file placement counts.
 
 `tolmap debt diff <before-report.json> <after-report.json>` compares two unfiltered,
 versioned DebtReports. It emits version 2 JSON with each finding marked `added`,
@@ -171,7 +192,11 @@ current DebtReport version. Cycles are compared using their compact summary,
 even when either input has full evidence; bundle-only changes are not reported.
 Cycle identity uses the closing route's file paths, so compact and full inputs
 for the same map compare equally. Filtered reports (including `--top`) are
-rejected. This subcommand is used instead of a map comparison
+rejected. Comparing a pinned report with an unpinned report, or reports pinned
+to different base-map SHA-256 values, exits 2 with no stdout. To measure a
+refactor, pin both reports to the same base, including the base report itself;
+independently partitioned maps otherwise measure repartitioning as well as code
+changes. This subcommand is used instead of a map comparison
 because the requested input is a raw, reproducible comparison of two already
 computed reports.
 

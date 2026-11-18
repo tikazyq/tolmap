@@ -122,3 +122,21 @@ history or generated-file evidence is unmeasured, not evidence of no debt.
 Use unfiltered current-version reports for `debt diff`; it compares raw findings
 and metric deltas, not maps. Cycles compare compact summaries in both evidence
 modes, so bundle-only differences are omitted. Read the files before proposing a structural edit.
+
+For a refactor, hold the base partition fixed on both reports; independently
+partitioned maps can make an untouched file's misplaced finding disappear:
+
+```sh
+tolmap debt --map "$BASE_MAP" --partition-from "$BASE_MAP" --format json > before-debt.json
+# After building the head map:
+tolmap debt --map "$HEAD_MAP" --partition-from "$BASE_MAP" --format json > after-debt.json
+tolmap debt diff before-debt.json after-debt.json
+```
+
+Existing paths keep the base district and name. New files use retained outgoing
+edges to base files (plurality, lowest district id on a tie); maps do not retain
+blended weights, so edges count equally. New files without such edges are
+`(unplaced)` and contribute only file-level findings. Read `partition_from` for
+the base hash/known commit, placed and unplaced counts and sorted unplaced paths.
+`debt diff` exits 2 for pinned versus unpinned reports or different pinned bases.
+Use the same base map bytes for both sides; keep reports unfiltered.
