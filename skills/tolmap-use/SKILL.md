@@ -6,7 +6,7 @@ description: Use tolmap for repository orientation, change boundaries, diff impa
 # Using tolmap
 
 This skill ships with the tolmap CLI (currently 0.1.0). Use the skill from the
-same checkout/release as the binary. Compact query JSON uses `tolmap.query/v2`;
+same checkout/release as the binary. Compact query JSON uses `tolmap.query/v3`;
 check and debt have their own report versions. See [QUERY](../../docs/QUERY.md),
 [CHECK](../../docs/CHECK.md) and [API](../../docs/API.md) for the full contracts.
 
@@ -66,12 +66,19 @@ entry paths. Paths are exact repository-relative paths, with `/`. JSON is the de
 `edge_kind` reports, not a runtime call chain. An empty result is not evidence
 that no runtime relationship exists.
 
-Every compact response includes map identity, `coverage`, `limit`, `total` and
-`truncated`, `omitted` and `next_limit`. `overview` returns all districts;
-`where`, `deps` and `route` default to 25 rows. If truncated, use the returned
-`next_limit` as `--limit` to get all rows
-or narrow the question; a truncated route is only a prefix. `where` can return
-several symbol candidates: inspect qualified names and line ranges.
+Every compact response includes map identity, `coverage`, `limit`, `total`,
+`returned`, `truncated`, `omitted`, `next_limit` and `directions`. `overview`
+returns all districts; `where` and `route` default to 25 rows overall. `deps`
+defaults to 25 rows **per requested direction**: `--direction both --limit N`
+returns up to N importers and N imports, sorted together by path then direction.
+Read `directions.in` and `directions.out` for each direction's `total`, `returned`
+and `omitted`; an unrequested direction is null. Envelope counts sum the requested
+directions. Other queries have `directions: null`. Zero limit returns totals
+without rows. If truncated, use `next_limit` as `--limit` to get all rows or narrow
+the question; for `deps` this is the largest requested direction's total.
+Text reports each requested direction and its own truncation notice. A truncated
+route is only a prefix. `where` can return several symbol candidates: inspect
+qualified names and line ranges.
 
 `coverage.refs` says hand/SCIP/mixed extraction, not reference completeness.
 Null counts mean unknown or unread, never zero. `lower_bound: true` means

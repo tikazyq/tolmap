@@ -9,8 +9,8 @@ use clap::Args;
 use sha2::{Digest, Sha256};
 
 use crate::query_contract::{
-    Direction, MapIdentity, Query, QueryCoverage, QueryEnvelope, QueryResponse, QueryResult,
-    QuerySymbol, ReferenceMode, QUERY_SCHEMA,
+    DependencyDirections, Direction, DirectionCounts, MapIdentity, Query, QueryCoverage,
+    QueryEnvelope, QueryResponse, QueryResult, QuerySymbol, ReferenceMode, QUERY_SCHEMA,
 };
 use crate::schema::{MapDocument, SymbolsDocument};
 
@@ -21,7 +21,7 @@ pub struct QueryOptions {
     pub map: PathBuf,
     #[arg(long, default_value = "json", value_parser = ["json", "text"])]
     pub format: String,
-    /// Maximum result rows (route: file steps); default 25, overview: all districts.
+    /// Maximum rows (deps: per direction; route: file steps); default 25, overview: all districts.
     #[arg(long)]
     pub limit: Option<usize>,
 }
@@ -186,9 +186,11 @@ impl Snapshot {
             coverage: self.coverage(symbols),
             limit,
             total,
+            returned: results.len(),
             truncated: total > limit,
             omitted: total.saturating_sub(limit),
             next_limit: (total > limit).then_some(total),
+            directions: None,
             results,
         }
     }
@@ -405,27 +407,61 @@ impl Snapshot {
                 }
             }
         }
-        let results = hits
-            .into_iter()
-            .map(|(path, d, file)| QueryResult::Dependency {
-                path,
-                district: self.district(file),
-                direction: if d == 0 {
-                    Direction::In
-                } else {
-                    Direction::Out
-                },
-            })
-            .collect();
-        self.response(
-            Query::Deps {
+        let mut counts = [
+            DirectionCounts {
+                total: 0,
+                returned: 0,
+                omitted: 0,
+            },
+            DirectionCounts {
+                total: 0,
+                returned: 0,
+                omitted: 0,
+            },
+        ];
+        let mut results = Vec::new();
+        for (path, d, file) in hits {
+            let count = &mut counts[usize::from(d)];
+            count.total += 1;
+            if count.returned < limit {
+                count.returned += 1;
+                results.push(QueryResult::Dependency {
+                    path,
+                    district: self.district(file),
+                    direction: if d == 0 {
+                        Direction::In
+                    } else {
+                        Direction::Out
+                    },
+                });
+            } else {
+                count.omitted += 1;
+            }
+        }
+        let total = counts.iter().map(|c| c.total).sum();
+        let omitted = counts.iter().map(|c| c.omitted).sum::<usize>();
+        let next_limit = (omitted > 0).then_some(counts[0].total.max(counts[1].total));
+        let [in_counts, out_counts] = counts;
+        QueryEnvelope {
+            schema: QUERY_SCHEMA.into(),
+            query: Query::Deps {
                 path: path.into(),
                 direction,
             },
+            map: self.identity.clone(),
+            coverage: self.coverage(None),
             limit,
+            total,
+            returned: results.len(),
+            truncated: omitted > 0,
+            omitted,
+            next_limit,
+            directions: Some(DependencyDirections {
+                r#in: (direction != Direction::Out).then_some(in_counts),
+                out: (direction != Direction::In).then_some(out_counts),
+            }),
             results,
-            None,
-        )
+        }
     }
 }
 
@@ -464,7 +500,28 @@ pub fn text(report: &QueryResponse) -> String {
         report.total,
         if report.truncated { " (truncated)" } else { "" }
     );
-    if let Some(n) = report.next_limit {
+    if let Some(directions) = &report.directions {
+        for (name, counts) in [("in", &directions.r#in), ("out", &directions.out)] {
+            if let Some(counts) = counts {
+                out.push_str(&format!(
+                    "{name}: {} of {} results{}\n",
+                    counts.returned,
+                    counts.total,
+                    if counts.omitted > 0 {
+                        " (truncated)"
+                    } else {
+                        ""
+                    }
+                ));
+                if counts.omitted > 0 {
+                    out.push_str(&format!(
+                        "{name}: {} rows omitted; repeat with --limit {} to return all {name} rows\n",
+                        counts.omitted, counts.total
+                    ));
+                }
+            }
+        }
+    } else if let Some(n) = report.next_limit {
         out.push_str(&format!(
             "{} rows omitted; repeat with --limit {n} to return all rows\n",
             report.omitted
