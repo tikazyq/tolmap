@@ -470,6 +470,7 @@ pub fn build_multi_source_with_progress(
         RefsMode::Hand,
         &InstallMode::Off,
         progress,
+        None,
     )?
     .0)
 }
@@ -492,8 +493,36 @@ pub fn build_multi_source_with_refs(
         refs,
         &InstallMode::Off,
         &crate::progress::Progress::silent(),
+        None,
     )?
     .0)
+}
+
+/// Extract head's static signals with history held at a named revision.
+/// `renames` maps paths at that revision to paths in the extracted tree.
+pub(crate) fn build_with_base_history(
+    repo: &Path,
+    sources: &[(String, LanguageKind)],
+    refs: RefsMode,
+    revision: &str,
+    renames: &BTreeMap<String, String>,
+) -> Result<GraphData> {
+    Ok(build_multi_source_inner(
+        repo,
+        sources,
+        false,
+        refs,
+        &InstallMode::Off,
+        &crate::progress::Progress::silent(),
+        Some(HistoryBasis { revision, renames }),
+    )?
+    .0)
+}
+
+#[derive(Clone, Copy)]
+struct HistoryBasis<'a> {
+    revision: &'a str,
+    renames: &'a BTreeMap<String, String>,
 }
 
 pub(crate) fn build_with_symbols(
@@ -508,6 +537,7 @@ pub(crate) fn build_with_symbols(
         RefsMode::Hand,
         &InstallMode::Off,
         &crate::progress::Progress::silent(),
+        None,
     )?;
     Ok((graph, spool.expect("symbol collection requested")))
 }
@@ -527,6 +557,7 @@ pub(crate) fn build_with_symbols_progress(
         refs,
         install,
         progress,
+        None,
     )?;
     Ok((graph, spool.expect("symbol collection requested")))
 }
@@ -542,6 +573,7 @@ pub(crate) fn build_multi_source_with_symbols(
         RefsMode::Hand,
         &InstallMode::Off,
         &crate::progress::Progress::silent(),
+        None,
     )?;
     Ok((graph, spool.expect("symbol collection requested")))
 }
@@ -553,7 +585,8 @@ pub(crate) fn build_multi_source_with_symbols_progress(
     install: &InstallMode,
     progress: &crate::progress::Progress,
 ) -> Result<(GraphData, crate::symbols::SymbolSpool)> {
-    let (graph, spool) = build_multi_source_inner(repo, sources, true, refs, install, progress)?;
+    let (graph, spool) =
+        build_multi_source_inner(repo, sources, true, refs, install, progress, None)?;
     Ok((graph, spool.expect("symbol collection requested")))
 }
 
@@ -564,6 +597,7 @@ fn build_multi_source_inner(
     refs: RefsMode,
     install: &InstallMode,
     progress: &crate::progress::Progress,
+    history_basis: Option<HistoryBasis<'_>>,
 ) -> Result<(GraphData, Option<crate::symbols::SymbolSpool>)> {
     let started = Instant::now();
     let mut symbol_collection = Duration::ZERO;
@@ -652,7 +686,7 @@ fn build_multi_source_inner(
         }
     };
     let graph_started = Instant::now();
-    let mut graph = finish_graph(repo, merged, progress)?;
+    let mut graph = finish_graph(repo, merged, progress, history_basis)?;
     graph.references = references;
     graph_time += graph_started.elapsed();
     let total = started.elapsed();
@@ -6342,6 +6376,7 @@ fn finish_graph(
     repo: &Path,
     merged: MergedSources,
     progress: &crate::progress::Progress,
+    history_basis: Option<HistoryBasis<'_>>,
 ) -> Result<GraphData> {
     let MergedSources {
         parsed,
@@ -6360,7 +6395,7 @@ fn finish_graph(
     } = merged;
 
     let history_stage = progress.stage(crate::progress::StageId::History, None);
-    let history = git_history(repo, &files, 4000, &history_stage)?;
+    let history = git_history(repo, &files, 4000, &history_stage, history_basis)?;
     history_stage.set(history.commits as u64);
     history_stage.finish();
     let semantic = semantic_vectors(&parsed);
@@ -6674,6 +6709,7 @@ fn git_history(
     files: &[String],
     max_commits: usize,
     progress: &crate::progress::StageCounter,
+    basis: Option<HistoryBasis<'_>>,
 ) -> Result<GitHistory> {
     let mut child = Command::new("git")
         .args([
@@ -6701,6 +6737,8 @@ fn git_history(
             // that renamed a file -- see the parity evidence in #32 for what
             // that does (or does not) change on the nine fixtures.
             "--no-renames",
+            basis.map_or("HEAD", |basis| basis.revision),
+            "--",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -6742,9 +6780,17 @@ fn git_history(
                 }
             }
             current = Some(BTreeSet::new());
-        } else if !line.trim().is_empty() && file_set.contains(line) {
-            if let Some(current) = current.as_mut() {
-                current.insert(line.to_owned());
+        } else if !line.trim().is_empty() {
+            // Use the diff's known renames rather than detecting renames in
+            // every historical commit (which fetches blobs in partial clones).
+            // Map before filtering: the old path is absent from head's files.
+            let file = basis
+                .and_then(|basis| basis.renames.get(line))
+                .map_or(line, String::as_str);
+            if file_set.contains(file) {
+                if let Some(current) = current.as_mut() {
+                    current.insert(file.to_owned());
+                }
             }
         }
     }
@@ -6794,6 +6840,72 @@ pub(crate) fn round_to(value: f64, digits: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_reads_a_named_revision_and_credits_renamed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(repo)
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        for value in 0..3 {
+            for file in ["old.py", "peer.py"] {
+                std::fs::write(repo.join(file), format!("VALUE = {value}\n")).unwrap();
+            }
+            git(&["add", "-A"]);
+            git(&["commit", "-qm", "coedit"]);
+        }
+        git(&["tag", "history-base"]);
+        git(&["mv", "old.py", "new.py"]);
+        git(&["commit", "-qm", "rename"]);
+        std::fs::write(repo.join("peer.py"), "VALUE = 99\n").unwrap();
+        git(&["commit", "-qam", "later edit"]);
+
+        let files = vec!["new.py".to_owned(), "peer.py".to_owned()];
+        let renames = BTreeMap::from([("old.py".to_owned(), "new.py".to_owned())]);
+        let progress = crate::progress::Progress::silent();
+        let stage = progress.stage(crate::progress::StageId::History, None);
+        let history = git_history(
+            repo,
+            &files,
+            3,
+            &stage,
+            Some(HistoryBasis {
+                revision: "history-base",
+                renames: &renames,
+            }),
+        )
+        .unwrap();
+        assert_eq!(history.commits, 3);
+        assert_eq!(
+            history.churn,
+            BTreeMap::from([("new.py".to_owned(), 3), ("peer.py".to_owned(), 3),])
+        );
+        assert_eq!(
+            history.cochange,
+            BTreeMap::from([(("new.py".to_owned(), "peer.py".to_owned()), 1.0),])
+        );
+    }
 
     #[test]
     fn nested_python_package_anchors_on_last_source_segment() {

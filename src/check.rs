@@ -7,8 +7,9 @@
 //!   new file with no resolved import into a base district is *unplaced*,
 //!   never guessed.
 //! - **Δq**: `Q(P, G_head) - Q(P, G_base)`, with `P` the base map's
-//!   partition (extended with the placed new files) held fixed and only the
-//!   graph changing. Nothing is re-partitioned: a Leiden run would move with
+//!   partition (extended with the placed new files) and base co-change history
+//!   held fixed. Only the diff's static signals change. Nothing is re-partitioned:
+//!   a Leiden run would move with
 //!   its own seed and cost minutes, and it would measure the new partition
 //!   rather than what the diff did to the old one.
 //!
@@ -80,13 +81,9 @@ const TOUCHED_LANDMARKS: [&str; 2] = ["bridge", "hazard"];
 pub const DEFAULT_MAX_DISTRICTS: usize = 4;
 
 /// The default `--max-dq`, applied when no threshold flag is given.
-/// Calibrated with [`DEFAULT_MAX_DISTRICTS`] (finding 60). `delta_q` moves
-/// on commits that change no file on the map, because the head's co-change
-/// history is one commit longer: that drift reached -0.004191 on django.
-/// The default sits above it, in the knee of django's tail (-0.017309, then
-/// -0.005940), and fires on 1, 0 and 0 of the 200 commits alone; every
-/// commit it fires on there also crossed more than 4 districts.
-pub const DEFAULT_MAX_DQ: f64 = 0.01;
+/// With co-change held at base, calibration places this between the largest
+/// drop without a new cross-district edge and the smallest real new import.
+pub const DEFAULT_MAX_DQ: f64 = 0.0001;
 
 pub const LOWER_BOUND_NOTE: &str = "numbers are a lower bound: tolmap's graph holds only the references it can resolve (calls through variables, dynamic imports and reflection are missed), so the change couples at least this much";
 
@@ -274,7 +271,24 @@ pub fn run(options: &CheckOptions) -> Result<CheckReport, CheckError> {
         )));
     }
     let stage = Instant::now();
-    let head_graph = extract_graph(&head_dir, &source)?;
+    let renames = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Renamed { from, to } => Some((from.clone(), to.clone())),
+            _ => None,
+        })
+        .collect();
+    // Hold the history window fixed: the diff's commits are not evidence of
+    // architectural coupling. Remap that history into head's file identities
+    // before candidate edges are built, so metrics and edge lists agree.
+    let head_graph = extract::build_with_base_history(
+        &head_dir,
+        std::slice::from_ref(&source),
+        RefsMode::default(),
+        &base,
+        &renames,
+    )
+    .map_err(|error| internal(error.context(format!("extract {}", head_dir.display()))))?;
     let head_graph_s = stage.elapsed().as_secs_f64();
     drop(scratch);
 

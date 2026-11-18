@@ -22,19 +22,17 @@ tolmap check <repo> --base <ref> [--head <ref>] [--base-map <map.json>]
 
 ## Default thresholds
 
-**With no threshold flag the check applies `--max-districts 4 --max-dq 0.01`.** Both are absolute: neither scales with the size of the repository.
+**With no threshold flag the check applies `--max-districts 4 --max-dq 0.0001`.** Both are absolute: neither scales with the size of the repository.
 
 - **Flags replace the defaults as a set.** Pass either threshold flag and only the flags you pass apply. `--max-dq 0.002` alone checks Δq and nothing else; no default mixes in.
 - **`--report-only` applies none.** That is the behaviour the check had before the defaults existed.
 - **The report says which applied.** `thresholds.source` is `default`, `flags` or `report_only`.
 
-The defaults come from replaying 600 real commits through the check on GitHub Actions: the last 200 first-parent commits of django, prometheus and vuejs/core at their corpus pins (docs/FINDINGS.md finding 60, `remote-build.yml` `command=check-calibrate`). On those commits they would have failed 2, 2 and 1 of the 200, every one of them a change that crossed 5 or more districts.
+The breadth default comes from replaying 600 real commits through the check on GitHub Actions: the last 200 first-parent commits of django, prometheus and vuejs/core at their corpus pins (docs/FINDINGS.md finding 60, `remote-build.yml` `command=check-calibrate`). The breadth threshold fails 2, 2 and 1 of the 200, every one of them a change that crossed 5 or more districts.
 
 - **`--max-districts 4`** sits above every repository's p99 (4, 3 and 3) and below a clear knee: above 4, the sample holds one commit at 5 and four at 7.
 - **Absolute, not a share of the map.** The three maps have 11–15, 11–14 and 6–8 districts, yet their tails are the same in absolute terms. A share of the map's districts would fire most on the map with the fewest.
-- **`--max-dq 0.01`** is set above a noise floor. Δq moves even on commits that change no file on the map, because the head's co-change history is one commit longer; on django that drift reached −0.0042. Below the floor, Δq cannot tell a small real coupling change from drift. 0.01 sits in the knee of django's tail (−0.0173, then −0.0059). In the sample it fires on one commit alone, and that commit also crossed 7 districts.
-
-Read a Δq failure with that floor in mind. A drop of a few thousandths can come from history rather than from the diff.
+- **`--max-dq 0.0001`** is calibrated with co-change held at the base revision. It sits between the largest drop seen without a new cross-district edge and the smallest drop from a real new import. A commit that changes no mapped file has exactly zero Δq, equal base and head modularity, and empty edge lists.
 
 ## Exit codes
 
@@ -52,7 +50,7 @@ On 2 and 3 nothing is printed on stdout; the reason is on stderr. Consumers depe
 The check builds two graphs, one for base and one for head. Each goes through the stages a map build runs before partitioning, with the build's defaults:
 
 1. **Detection** runs on the base checkout. At low confidence it is refused, as the service refuses it. The source it picks is extracted on both sides, so the two graphs describe the same codebase.
-2. **Extraction.**
+2. **Extraction.** Each side supplies its own static signals (imports, symbol uses, identifiers and paths), but both read co-change from the base revision's history window. Files renamed by the diff receive their base history under their head paths. The diff's own commits do not become co-change observations.
 3. **Blend and prune:** mass-normalised blending (finding 1) and the `node-relative` prune.
 
 This is the graph the partitioner sees. The base partition `P` is the base map's district of every file.
@@ -116,7 +114,7 @@ The text format starts with three lines: districts crossed, Δq and the verdict.
 
 ## Examples
 
-Both examples are real output, not illustrations. They come from GitHub Actions ([remote-build run 36324295341](https://github.com/onsager-ai/tolmap/actions/runs/36324295341), `command=check`, `extra_args=--base HEAD~30`). The repository is django at its corpus pin `dd6f6b1` (the working tree), checked against 30 commits earlier (`5f0293b`), under the default thresholds.
+These are historical examples from before co-change was held at base and before the Δq default was lowered to 0.0001; their graph numbers and threshold are not current output. They come from GitHub Actions ([remote-build run 36324295341](https://github.com/onsager-ai/tolmap/actions/runs/36324295341), `command=check`, `extra_args=--base HEAD~30`). The repository is django at its corpus pin `dd6f6b1` (the working tree), checked against 30 commits earlier (`5f0293b`), under the default thresholds.
 
 Three things in them are worth reading closely:
 
