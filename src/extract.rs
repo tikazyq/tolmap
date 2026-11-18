@@ -7259,6 +7259,9 @@ mod tests {
         write(dir.path(), "pkg/a.py", "value = 1\n");
         write(dir.path(), "pkg/tests/a.py", "assert True\n");
         write(dir.path(), "pkg/tests/b.py", "assert True\n");
+        git_in(dir.path(), &["init", "-q"]);
+        git_in(dir.path(), &["add", "-A"]);
+        git_in(dir.path(), &["commit", "-qm", "init"]);
         let graph = build_multi_source(
             dir.path(),
             &[
