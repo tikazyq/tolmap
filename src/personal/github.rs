@@ -117,7 +117,7 @@ fn helper_setting(exe: &Path) -> OsString {
     OsString::from_vec(setting)
 }
 
-fn inherited(keys: &[&'static str]) -> impl Iterator<Item = (&'static str, OsString)> + '_ {
+fn inherited(keys: &'static [&'static str]) -> impl Iterator<Item = (&'static str, OsString)> {
     keys.iter()
         .filter_map(|&key| std::env::var_os(key).map(|value| (key, value)))
 }
@@ -325,10 +325,7 @@ fn run_provider(command: &mut Command, request: &[u8], timeout: Duration) -> Opt
                         if matches!(
                             e.kind(),
                             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        ()
-                    }
+                        ) => {}
                     Err(_) => return None,
                 }
             }
@@ -342,10 +339,7 @@ fn run_provider(command: &mut Command, request: &[u8], timeout: Duration) -> Opt
                         if matches!(
                             e.kind(),
                             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        ()
-                    }
+                        ) => {}
                     _ => return None,
                 }
             }
