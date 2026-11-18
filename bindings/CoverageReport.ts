@@ -2,4 +2,4 @@
 import type { CoverageLanguage } from "./CoverageLanguage";
 import type { ReferenceCoverage } from "./ReferenceCoverage";
 
-export type CoverageReport = { zero_edge_files: number, total_files: number, by_language: { [key in string]: CoverageLanguage }, references?: { [key in string]: ReferenceCoverage } | null, };
+export type CoverageReport = { zero_edge_files: number, total_files: number, by_language: { [key in string]: CoverageLanguage }, references?: { [key in string]: ReferenceCoverage } | null, build_output_mirror?: number, };

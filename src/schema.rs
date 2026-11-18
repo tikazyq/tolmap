@@ -108,6 +108,14 @@ pub struct CoverageReport {
     // one built before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<BTreeMap<String, ReferenceCoverage>>,
+    // Import statements resolved by the guarded build-output mirror, before
+    // edge deduplication. Zero stays absent for existing map fixtures.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub build_output_mirror: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 // One language's reference path under `--refs scip`. Plain `//` comments
@@ -406,6 +414,7 @@ pub struct GraphData {
     /// map's `coverage.references`. Serialized only when present, so a
     /// hand-written graph dumps byte-identically.
     pub references: Option<BTreeMap<String, ReferenceCoverage>>,
+    pub build_output_mirror: usize,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +432,8 @@ struct GraphDataWire {
     edges: Vec<SignalEdge>,
     #[serde(default)]
     references: Option<BTreeMap<String, ReferenceCoverage>>,
+    #[serde(default)]
+    build_output_mirror: usize,
 }
 
 struct GraphImports<'a>(&'a GraphData);
@@ -466,7 +477,9 @@ impl Serialize for GraphData {
     {
         // Keep the derived serializer's established field order so
         // `tolmap dump-graph` remains byte-identical.
-        let fields = if self.references.is_some() { 11 } else { 10 };
+        let fields = 10
+            + usize::from(self.references.is_some())
+            + usize::from(self.build_output_mirror != 0);
         let mut state = serializer.serialize_struct("GraphData", fields)?;
         state.serialize_field("repo", &self.repo)?;
         state.serialize_field("pkg", &self.pkg)?;
@@ -480,6 +493,9 @@ impl Serialize for GraphData {
         state.serialize_field("edges", &self.edges)?;
         if let Some(references) = &self.references {
             state.serialize_field("references", references)?;
+        }
+        if self.build_output_mirror != 0 {
+            state.serialize_field("build_output_mirror", &self.build_output_mirror)?;
         }
         state.end()
     }
@@ -541,6 +557,7 @@ impl<'de> Deserialize<'de> for GraphData {
             nodes: wire.nodes,
             edges: wire.edges,
             references: wire.references,
+            build_output_mirror: wire.build_output_mirror,
         })
     }
 }
@@ -585,6 +602,34 @@ mod tests {
     }
 
     #[test]
+    fn mirror_coverage_is_omitted_at_zero_and_round_trips_when_present() {
+        let mut coverage = CoverageReport {
+            zero_edge_files: 0,
+            total_files: 1,
+            by_language: BTreeMap::new(),
+            references: None,
+            build_output_mirror: 0,
+        };
+        let old = serde_json::to_value(&coverage).unwrap();
+        assert!(old.get("build_output_mirror").is_none());
+        assert_eq!(
+            serde_json::from_value::<CoverageReport>(old)
+                .unwrap()
+                .build_output_mirror,
+            0
+        );
+        coverage.build_output_mirror = 2;
+        let value = serde_json::to_value(&coverage).unwrap();
+        assert_eq!(value["build_output_mirror"], 2);
+        assert_eq!(
+            serde_json::from_value::<CoverageReport>(value)
+                .unwrap()
+                .build_output_mirror,
+            2
+        );
+    }
+
+    #[test]
     fn graph_data_keeps_path_based_json_with_indexed_edges() {
         let data = GraphData {
             repo: "fixture".to_owned(),
@@ -610,10 +655,12 @@ mod tests {
                 .collect(),
             edges: Vec::new(),
             references: None,
+            build_output_mirror: 0,
         };
 
         let bytes = serde_json::to_vec(&data).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("build_output_mirror").is_none());
         assert_eq!(
             value["imports"],
             serde_json::json!([["a.go", "pkg/b.go", 0.5]])
@@ -627,5 +674,15 @@ mod tests {
         assert_eq!(round_trip.imports, data.imports);
         assert_eq!(round_trip.uses, data.uses);
         assert_eq!(serde_json::to_vec(&round_trip).unwrap(), bytes);
+
+        let mut mirrored = round_trip;
+        mirrored.build_output_mirror = 2;
+        let bytes = serde_json::to_vec(&mirrored).unwrap();
+        let round_trip: GraphData = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(round_trip.build_output_mirror, 2);
+        assert_eq!(
+            serde_json::to_value(round_trip).unwrap()["build_output_mirror"],
+            2
+        );
     }
 }
