@@ -108,6 +108,14 @@ pub struct CoverageReport {
     // one built before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<BTreeMap<String, ReferenceCoverage>>,
+    // Import statements resolved through the guarded build-output mirror.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[ts(as = "Option<usize>", optional)]
+    pub build_output_mirror: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 // One language's reference path under `--refs scip`. Plain `//` comments
@@ -406,6 +414,7 @@ pub struct GraphData {
     /// map's `coverage.references`. Serialized only when present, so a
     /// hand-written graph dumps byte-identically.
     pub references: Option<BTreeMap<String, ReferenceCoverage>>,
+    pub build_output_mirror: usize,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +432,8 @@ struct GraphDataWire {
     edges: Vec<SignalEdge>,
     #[serde(default)]
     references: Option<BTreeMap<String, ReferenceCoverage>>,
+    #[serde(default)]
+    build_output_mirror: usize,
 }
 
 struct GraphImports<'a>(&'a GraphData);
@@ -466,7 +477,9 @@ impl Serialize for GraphData {
     {
         // Keep the derived serializer's established field order so
         // `tolmap dump-graph` remains byte-identical.
-        let fields = if self.references.is_some() { 11 } else { 10 };
+        let fields = 10
+            + usize::from(self.references.is_some())
+            + usize::from(self.build_output_mirror != 0);
         let mut state = serializer.serialize_struct("GraphData", fields)?;
         state.serialize_field("repo", &self.repo)?;
         state.serialize_field("pkg", &self.pkg)?;
@@ -480,6 +493,9 @@ impl Serialize for GraphData {
         state.serialize_field("edges", &self.edges)?;
         if let Some(references) = &self.references {
             state.serialize_field("references", references)?;
+        }
+        if self.build_output_mirror != 0 {
+            state.serialize_field("build_output_mirror", &self.build_output_mirror)?;
         }
         state.end()
     }
@@ -541,6 +557,7 @@ impl<'de> Deserialize<'de> for GraphData {
             nodes: wire.nodes,
             edges: wire.edges,
             references: wire.references,
+            build_output_mirror: wire.build_output_mirror,
         })
     }
 }
@@ -610,6 +627,7 @@ mod tests {
                 .collect(),
             edges: Vec::new(),
             references: None,
+            build_output_mirror: 0,
         };
 
         let bytes = serde_json::to_vec(&data).unwrap();

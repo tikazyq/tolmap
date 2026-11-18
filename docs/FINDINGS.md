@@ -2911,3 +2911,11 @@ The names are the product namer's with #144's rule (finding 56), unseeded, since
 - The 118 and 112 SCIP-only pairs classed "other" in the all-pairs table are mostly namespace-only (the 132 and 133 above); they were not read one by one.
 - `check:view`'s taps (a district, a file and a symbol each produce a card) ran on its two pinned maps, not on the Rust map: the screenshots show the Rust map at three zooms without tapping. The viewer changes here are a language label and two hub basenames.
 - `eval/batch_stability.py` was not run: it imports the frozen Python reference, which has no Rust.
+
+## 58. An absent build directory can identify a workspace package's source
+
+Finding 42 measured 14,734 unresolved workspace-package import statements and 13 resolved ones at the `twentyhq/twenty` corpus pin. The guarded mirror covers cases such as `twenty-shared/types`, where the package metadata names build output and the corresponding source lives under `packages/twenty-shared/src/types`.
+
+After ordinary resolution fails, the resolver checks whether every declared `main`, `module` and `types` path starts in the same absent directory. It mirrors matching `exports` and `typesVersions` targets from that directory into `src/` and accepts the result only when the file and index probes together find exactly one parsed TypeScript file. It reads only package metadata and parsed paths. `dump-graph` and map `coverage` record `build_output_mirror` once per resolved statement, before edge deduplication, and omit it when zero.
+
+The post-change count at the corpus pin is pending a CI run. Read `build_output_mirror` from `tolmap dump-graph <checkout> --all-sources --out <graph.json>` at the pin in `eval/corpus.toml` to measure the recovered statements.

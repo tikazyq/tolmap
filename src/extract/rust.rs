@@ -2179,6 +2179,7 @@ pub(crate) fn resolve(
         directed,
         fanin,
         uses,
+        build_output_mirrors: BTreeMap::new(),
         module_for,
     })
 }

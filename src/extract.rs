@@ -970,6 +970,8 @@ struct SourceIntermediate {
     directed: BTreeMap<(FileId, FileId), f64>,
     fanin: BTreeMap<FileId, f64>,
     uses: BTreeSet<(FileId, FileId, String)>,
+    // Per importer so overlapping sources count only the winning file's statements.
+    build_output_mirrors: BTreeMap<FileId, usize>,
     /// File -> the module/display name `finish_graph` puts on `SourceNode`.
     /// Python's is a dotted module name (`module_name`); Go/TypeScript's is
     /// just the file path. Carried as a map instead of a closure so it can
@@ -991,6 +993,7 @@ struct MergedSources {
     uses: BTreeSet<(FileId, FileId, String)>,
     module_for: BTreeMap<String, String>,
     file_language: BTreeMap<String, LanguageKind>,
+    build_output_mirror: usize,
     /// One `(pkg, lang)` per source, in the same sorted order they were
     /// merged -- `GraphData.sources`.
     sources: Vec<(String, String)>,
@@ -1041,6 +1044,7 @@ fn union_sources(mut intermediates: Vec<SourceIntermediate>) -> Result<MergedSou
             directed,
             fanin,
             uses,
+            build_output_mirrors,
             module_for,
         } = intermediate;
         let file_language = files.iter().map(|file| (file.clone(), language)).collect();
@@ -1053,6 +1057,7 @@ fn union_sources(mut intermediates: Vec<SourceIntermediate>) -> Result<MergedSou
             uses,
             module_for,
             file_language,
+            build_output_mirror: build_output_mirrors.values().sum(),
             sources: vec![(pkg.clone(), language.as_str().to_owned())],
             dominant_pkg: pkg,
             dominant_lang: language,
@@ -1095,6 +1100,7 @@ fn union_sources(mut intermediates: Vec<SourceIntermediate>) -> Result<MergedSou
     let mut fanin = BTreeMap::<FileId, f64>::new();
     let mut uses = BTreeSet::new();
     let mut sources = Vec::with_capacity(intermediates.len());
+    let mut build_output_mirror = 0;
     let mut dominant: Option<(usize, String, LanguageKind)> = None;
 
     for (idx, intermediate) in intermediates.into_iter().enumerate() {
@@ -1107,6 +1113,7 @@ fn union_sources(mut intermediates: Vec<SourceIntermediate>) -> Result<MergedSou
             directed: source_directed,
             fanin: source_fanin,
             uses: source_uses,
+            build_output_mirrors: source_mirrors,
             module_for: source_module_for,
         } = intermediate;
 
@@ -1127,6 +1134,12 @@ fn union_sources(mut intermediates: Vec<SourceIntermediate>) -> Result<MergedSou
         let better = dominant.as_ref().is_none_or(|(best, _, _)| kept > *best);
         if better {
             dominant = Some((kept, pkg, language));
+        }
+
+        for (file_id, count) in source_mirrors {
+            if owner_index.get(&source_files[file_id as usize]) == Some(&idx) {
+                build_output_mirror += count;
+            }
         }
 
         // Every edge/use below is intra-source by construction (resolution
@@ -1176,6 +1189,7 @@ fn union_sources(mut intermediates: Vec<SourceIntermediate>) -> Result<MergedSou
         uses,
         module_for,
         file_language,
+        build_output_mirror,
         sources,
         dominant_pkg,
         dominant_lang,
@@ -2229,6 +2243,7 @@ fn parse_python_with_progress(
         directed,
         fanin,
         uses,
+        build_output_mirrors: BTreeMap::new(),
         module_for,
     })
 }
@@ -3728,6 +3743,8 @@ fn parse_multi_with_progress(
         .collect::<BTreeMap<_, _>>();
     // Every TypeScript file's exports with their specifiers resolved, for
     // following an import through barrels to the defining file (finding 51).
+    // Keep the existing traversal so a mirror cannot retarget an already
+    // resolved import by making a previously opaque barrel hop followable.
     let ts_table = TsExportTable {
         files: raw
             .iter()
@@ -3741,7 +3758,7 @@ fn parse_multi_with_progress(
             })
             .filter_map(|(file, exports)| {
                 let id = *ids.get(file)?;
-                let resolve = |specifier: &str| match resolve_multi(
+                let resolve = |specifier: &str| match resolve_multi_legacy(
                     repo,
                     language,
                     specifier,
@@ -3751,7 +3768,7 @@ fn parse_multi_with_progress(
                     &ids,
                 ) {
                     ResolvedTargets::One(target) => Some(target),
-                    ResolvedTargets::Empty | ResolvedTargets::Many(_) => None,
+                    _ => None,
                 };
                 let bindings = exports
                     .bindings
@@ -3792,6 +3809,7 @@ fn parse_multi_with_progress(
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
     let mut report = Vec::new();
+    let mut build_output_mirrors = BTreeMap::new();
     for file in parsed.keys() {
         let source_id = ids[file];
         let FileRaw::Multi {
@@ -3807,6 +3825,9 @@ fn parse_multi_with_progress(
         };
         for (index, path) in imports.iter().enumerate() {
             let resolved = resolve_multi(repo, language, path, file, modules, &by_directory, &ids);
+            if matches!(resolved, ResolvedTargets::BuildOutputMirror(_)) {
+                *build_output_mirrors.entry(source_id).or_default() += 1;
+            }
             let package = resolved.as_slice();
             // A TypeScript import links the files that define the names it
             // takes, followed through re-exports; where a name cannot be
@@ -3958,6 +3979,7 @@ fn parse_multi_with_progress(
         directed,
         fanin,
         uses,
+        build_output_mirrors,
         module_for,
     })
 }
@@ -3980,12 +4002,9 @@ struct ModuleIndex {
     /// `paths` entry and every workspace `package.json` name. Package names
     /// have the empty (global) scope.
     ts: Vec<TsPrefix>,
-    /// `package.json` fields relevant to entry-point resolution (`exports`,
-    /// `types`/`typings`, `module`, `main`), keyed by the same repo-relative
-    /// directory a `TsPrefix { is_package: true, .. }` entry names as its
-    /// `target`. Only populated for a `TsPrefix` that came from a
-    /// `package.json` name -- a tsconfig `paths` alias has no manifest to
-    /// consult and resolves through `target` alone.
+    /// Workspace manifests keyed by the repo-relative directory in the
+    /// corresponding package prefix. A tsconfig `paths` alias resolves
+    /// through its target alone.
     packages: BTreeMap<String, PackageManifest>,
 }
 
@@ -4012,6 +4031,8 @@ struct PackageManifest {
     types: Option<String>,
     module: Option<String>,
     main: Option<String>,
+    types_versions: Option<serde_json::Value>,
+    absent_build_dir: Option<String>,
 }
 
 impl ModuleIndex {
@@ -4268,8 +4289,34 @@ fn package_manifest(path: &Path) -> Option<(String, PackageManifest)> {
         types: string_field("types").or_else(|| string_field("typings")),
         module: string_field("module"),
         main: string_field("main"),
+        types_versions: value.get("typesVersions").cloned(),
+        absent_build_dir: absent_build_dir(&value, path.parent()?).map(str::to_owned),
     };
     Some((name, manifest))
+}
+
+fn absent_build_dir<'a>(manifest: &'a serde_json::Value, package: &Path) -> Option<&'a str> {
+    let mut shared = None;
+    for value in ["main", "module", "types"]
+        .into_iter()
+        .filter_map(|field| manifest.get(field))
+    {
+        let (directory, _) = package_target(value.as_str()?)?.split_once('/')?;
+        if shared.is_some_and(|previous| previous != directory) {
+            return None;
+        }
+        shared = Some(directory);
+    }
+    shared.filter(|directory| matches!(package.join(directory).try_exists(), Ok(false)))
+}
+
+// A mirror target must name a path inside this package.
+fn package_target(target: &str) -> Option<&str> {
+    let target = target.trim_start_matches("./");
+    target
+        .split('/')
+        .all(|part| !matches!(part, "" | "." | ".."))
+        .then_some(target)
 }
 
 /// Return `compilerOptions.paths` from one tsconfig as repo-relative roots.
@@ -5364,6 +5411,7 @@ fn typescript_named(root: Node<'_>, source: &[u8]) -> Vec<(String, String)> {
 enum ResolvedTargets<'a> {
     Empty,
     One(FileId),
+    BuildOutputMirror(FileId),
     Many(&'a [FileId]),
 }
 
@@ -5371,13 +5419,38 @@ impl ResolvedTargets<'_> {
     fn as_slice(&self) -> &[FileId] {
         match self {
             Self::Empty => &[],
-            Self::One(target) => std::slice::from_ref(target),
+            Self::One(target) | Self::BuildOutputMirror(target) => std::slice::from_ref(target),
             Self::Many(targets) => targets,
         }
     }
 }
 
 fn resolve_multi<'a>(
+    repo: &Path,
+    language: LanguageKind,
+    import: &str,
+    source_file: &str,
+    modules: &ModuleIndex,
+    by_directory: &'a BTreeMap<String, Vec<FileId>>,
+    by_file: &BTreeMap<String, FileId>,
+) -> ResolvedTargets<'a> {
+    let resolved = resolve_multi_legacy(
+        repo,
+        language,
+        import,
+        source_file,
+        modules,
+        by_directory,
+        by_file,
+    );
+    if language == LanguageKind::TypeScript && matches!(resolved, ResolvedTargets::Empty) {
+        return mirror_workspace_import(import, modules, by_file)
+            .map_or(ResolvedTargets::Empty, ResolvedTargets::BuildOutputMirror);
+    }
+    resolved
+}
+
+fn resolve_multi_legacy<'a>(
     repo: &Path,
     language: LanguageKind,
     import: &str,
@@ -5449,6 +5522,95 @@ fn resolve_multi<'a>(
             ts_candidate(&base, by_file).map_or(ResolvedTargets::Empty, ResolvedTargets::One)
         }
         LanguageKind::Python | LanguageKind::Rust => ResolvedTargets::Empty,
+    }
+}
+
+/// Try the source mirror only after the whole ordinary resolution chain fails.
+fn mirror_workspace_import(
+    import: &str,
+    modules: &ModuleIndex,
+    by_file: &BTreeMap<String, FileId>,
+) -> Option<FileId> {
+    if import.starts_with('.') {
+        return None;
+    }
+    let mut target = None;
+    for entry in modules.ts.iter().filter(|entry| entry.is_package) {
+        let Some(rest) = strip_module_prefix(import, &entry.prefix) else {
+            continue;
+        };
+        let manifest = &modules.packages[&entry.target];
+        let Some(build_dir) = &manifest.absent_build_dir else {
+            continue;
+        };
+        let subpath = (!rest.is_empty()).then_some(rest);
+        let mut templates = Vec::new();
+        if let Some((value, capture)) = manifest
+            .exports
+            .as_ref()
+            .and_then(|exports| match_exports(exports, subpath))
+        {
+            collect_mirror_targets(value, &capture, &mut templates);
+        }
+        if let (Some(subpath), Some(versions)) = (
+            subpath,
+            manifest.types_versions.as_ref().and_then(|v| v.as_object()),
+        ) {
+            // We don't select a TypeScript version. Every matching version's
+            // targets must agree on the one parsed source file.
+            for paths in versions.values().filter_map(|v| v.as_object()) {
+                if let Some((value, capture)) = match_export_key(paths, subpath) {
+                    collect_mirror_targets(value, &capture, &mut templates);
+                }
+            }
+        }
+        for template in &templates {
+            let Some(path) =
+                package_target(template).and_then(|path| package_relative_suffix(path, build_dir))
+            else {
+                continue;
+            };
+            // Strip declaration suffixes before their shorter counterparts.
+            let stem = [
+                ".d.ts", ".d.mts", ".d.cts", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts",
+                ".cts",
+            ]
+            .into_iter()
+            .find_map(|ext| path.strip_suffix(ext))
+            .unwrap_or(path);
+            let base = join_slash(&entry.target, &format!("src/{stem}"));
+            for candidate in [
+                format!("{base}.ts"),
+                format!("{base}.tsx"),
+                format!("{base}/index.ts"),
+                format!("{base}/index.tsx"),
+            ] {
+                if let Some(&file) = by_file.get(&candidate) {
+                    if target.is_some_and(|previous| previous != file) {
+                        return None;
+                    }
+                    target = Some(file);
+                }
+            }
+        }
+    }
+    target
+}
+
+fn collect_mirror_targets(value: &serde_json::Value, capture: &str, targets: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(template) => targets.push(substitute_wildcard(template, capture)),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_mirror_targets(value, capture, targets);
+            }
+        }
+        serde_json::Value::Object(conditions) => {
+            for value in conditions.values() {
+                collect_mirror_targets(value, capture, targets);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -5630,33 +5792,28 @@ fn exports_candidates(
     subpath: Option<&str>,
     exports: &serde_json::Value,
 ) -> Vec<String> {
-    let key = subpath.map_or_else(|| ".".to_owned(), |s| format!("./{s}"));
-    let mut templates = Vec::new();
-    match exports {
-        serde_json::Value::String(value) => {
-            if key == "." {
-                templates.push((value.as_str(), String::new()));
-            }
-        }
-        serde_json::Value::Object(map) => {
-            if map.keys().any(|k| k.starts_with('.')) {
-                if let Some((value, capture)) = match_export_key(map, &key) {
-                    for template in pick_conditions(value) {
-                        templates.push((template, capture.clone()));
-                    }
-                }
-            } else if key == "." {
-                for template in pick_conditions(exports) {
-                    templates.push((template, String::new()));
-                }
-            }
-        }
-        _ => {}
-    }
-    templates
+    let Some((value, capture)) = match_exports(exports, subpath) else {
+        return Vec::new();
+    };
+    pick_conditions(value)
         .into_iter()
-        .map(|(template, capture)| join_slash(pkg_dir, &substitute_wildcard(template, &capture)))
+        .map(|template| join_slash(pkg_dir, &substitute_wildcard(template, &capture)))
         .collect()
+}
+
+fn match_exports<'a>(
+    exports: &'a serde_json::Value,
+    subpath: Option<&str>,
+) -> Option<(&'a serde_json::Value, String)> {
+    if let Some(map) = exports
+        .as_object()
+        .filter(|map| map.keys().any(|k| k.starts_with('.')))
+    {
+        let key = subpath.map_or_else(|| ".".to_owned(), |s| format!("./{s}"));
+        match_export_key(map, &key)
+    } else {
+        subpath.is_none().then_some((exports, String::new()))
+    }
 }
 
 /// Exact key first (covers both `"."` and a literal `"./subpath"`), else the
@@ -5851,6 +6008,7 @@ fn finish_graph(
         uses,
         module_for,
         file_language,
+        build_output_mirror,
         sources,
         dominant_pkg,
         dominant_lang,
@@ -6046,6 +6204,7 @@ fn finish_graph(
         nodes,
         edges,
         references: None,
+        build_output_mirror,
     })
 }
 
@@ -7265,6 +7424,220 @@ mod tests {
         );
     }
 
+    fn mirror_fixture(manifest: &str, importer: &str, files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "package.json", r#"{"workspaces":["packages/*"]}"#);
+        write(root, "packages/shared/package.json", manifest);
+        write(root, "app.ts", importer);
+        for file in files {
+            write(
+                root,
+                &format!("packages/shared/{file}"),
+                "export const value = 1;\n",
+            );
+        }
+        dir
+    }
+
+    #[test]
+    fn workspace_exports_mirror_an_absent_build_directory() {
+        let dir = mirror_fixture(
+            r#"{"name":"shared","main":"dist/main.js","module":"./dist/main.mjs","types":"dist/main.d.ts",
+                "exports":{"./*":{"import":"./dist/*.js","types":"./dist/*.d.ts"},"./widget.js":"./dist/widget.js"}}"#,
+            "import 'shared/types'; import 'shared/widget.js';",
+            &["src/types/index.ts", "src/widget.tsx"],
+        );
+        assert_eq!(
+            resolved_import_edges(dir.path(), ".", LanguageKind::TypeScript),
+            BTreeSet::from([
+                (
+                    "app.ts".to_owned(),
+                    "packages/shared/src/types/index.ts".to_owned()
+                ),
+                (
+                    "app.ts".to_owned(),
+                    "packages/shared/src/widget.tsx".to_owned()
+                ),
+            ]),
+        );
+    }
+
+    #[test]
+    fn workspace_types_versions_alone_mirror_the_matching_subpath() {
+        let dir = mirror_fixture(
+            r#"{"name":"shared","types":"dist/index.d.ts","typesVersions":{"*":{
+                "api/*":["dist/wildcard/*.d.ts"],"api/client":["dist/client.d.ts", "dist/missing.d.ts"]}}}"#,
+            "import 'shared/api/client';",
+            &["src/client/index.tsx", "src/wildcard/client.ts"],
+        );
+        assert_eq!(
+            resolved_import_edges(dir.path(), ".", LanguageKind::TypeScript),
+            BTreeSet::from([(
+                "app.ts".to_owned(),
+                "packages/shared/src/client/index.tsx".to_owned()
+            )]),
+        );
+    }
+
+    #[test]
+    fn workspace_exports_mirror_a_nested_package_entry() {
+        let dir = mirror_fixture(
+            r#"{"name":"shared","main":"dist/lib/entry.js","exports":{".":"./dist/lib/entry.js"}}"#,
+            "import 'shared';",
+            &["src/lib/entry.ts"],
+        );
+        assert_eq!(
+            resolved_import_edges(dir.path(), ".", LanguageKind::TypeScript),
+            BTreeSet::from([(
+                "app.ts".to_owned(),
+                "packages/shared/src/lib/entry.ts".to_owned()
+            )]),
+        );
+    }
+
+    #[test]
+    fn workspace_mirror_requires_entry_fields_to_agree_on_an_absent_directory() {
+        for (fields, has_dist) in [
+            (r#""main":"dist/main.js","types":"dist/main.d.ts","#, true),
+            (
+                r#""main":"dist/main.js","types":"declarations/main.d.ts","#,
+                false,
+            ),
+            (r#""main":"index.js","types":"dist/main.d.ts","#, false),
+            ("", false),
+        ] {
+            let manifest =
+                format!(r#"{{"name":"shared",{fields}"exports":{{"./types":"./dist/types.js"}}}}"#);
+            let dir = mirror_fixture(&manifest, "import 'shared/types';", &["src/types.ts"]);
+            if has_dist {
+                fs::create_dir(dir.path().join("packages/shared/dist")).unwrap();
+            }
+            assert!(resolved_import_edges(dir.path(), ".", LanguageKind::TypeScript).is_empty());
+        }
+    }
+
+    #[test]
+    fn workspace_mirror_rejects_ambiguity_across_files_targets_and_versions() {
+        let dir = mirror_fixture(
+            r#"{"name":"shared","main":"dist/index.js",
+                "exports":{"./forms":"./dist/forms.js","./different":{"import":"./dist/a.js","node":["./dist/b.js"]},
+                           "./mixed":"./dist/a.js"},
+                "typesVersions":{"*":{"mixed":["dist/b.d.ts"],"versioned":["dist/a.d.ts"]},
+                                 ">=5":{"versioned":["dist/b.d.ts"]}}}"#,
+            "import 'shared/forms'; import 'shared/different'; import 'shared/mixed'; import 'shared/versioned'; import 'shared/unlisted';",
+            &["src/forms.ts", "src/forms/index.ts", "src/a.ts", "src/b.ts", "src/unlisted.ts"],
+        );
+        assert!(resolved_import_edges(dir.path(), ".", LanguageKind::TypeScript).is_empty());
+    }
+
+    #[test]
+    fn workspace_mirror_preserves_existing_targets_and_barrel_attribution() {
+        let dir = mirror_fixture(
+            r#"{"name":"shared","main":"dist/index.js","exports":{"./*":"./dist/*.js"}}"#,
+            "import 'shared/direct'; import 'shared/alias'; import { value } from './barrel';",
+            &[
+                "direct.ts",
+                "src/direct.ts",
+                "src/alias.ts",
+                "src/mirrored.ts",
+            ],
+        );
+        write(
+            dir.path(),
+            "config/tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":"..","paths":{"shared/alias":["aliased"]}}}"#,
+        );
+        write(dir.path(), "aliased.ts", "export const alias = 1;\n");
+        write(
+            dir.path(),
+            "barrel.ts",
+            "export { value } from 'shared/mirrored';\n",
+        );
+        assert_eq!(
+            resolved_import_edges(dir.path(), ".", LanguageKind::TypeScript),
+            BTreeSet::from([
+                ("app.ts".to_owned(), "aliased.ts".to_owned()),
+                ("app.ts".to_owned(), "barrel.ts".to_owned()),
+                ("app.ts".to_owned(), "packages/shared/direct.ts".to_owned()),
+                (
+                    "barrel.ts".to_owned(),
+                    "packages/shared/src/mirrored.ts".to_owned()
+                ),
+            ]),
+        );
+    }
+
+    #[test]
+    fn workspace_mirror_counts_statements_through_dump_graph_and_map_coverage() {
+        let dir = mirror_fixture(
+            r#"{"name":"shared","main":"dist/index.js","exports":{"./*":"./dist/*.js"}}"#,
+            "import { value } from 'shared/mirrored'; import 'shared/mirrored'; import 'shared/direct'; import 'shared/typo';",
+            &["src/mirrored.ts", "direct.ts"],
+        );
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let graph = build(dir.path(), ".", LanguageKind::TypeScript).unwrap();
+        assert_eq!(graph.imports.len(), 2);
+        let mut dump = serde_json::to_value(&graph).unwrap();
+        assert_eq!(dump["build_output_mirror"], 2);
+        let decoded: GraphData = serde_json::from_value(dump.clone()).unwrap();
+        assert_eq!(decoded.build_output_mirror, 2);
+
+        dump.as_object_mut().unwrap().remove("build_output_mirror");
+        let legacy: GraphData = serde_json::from_value(dump).unwrap();
+        assert_eq!(legacy.build_output_mirror, 0);
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("build_output_mirror")
+            .is_none());
+
+        for (name, graph, count) in [("mirrored", decoded, Some(2)), ("legacy", legacy, None)] {
+            let path = crate::geometry::build_from_graph(
+                graph,
+                name.to_owned(),
+                dir.path(),
+                1.0,
+                crate::geometry::BuildFeatures {
+                    parcels: false,
+                    prune_variant: Default::default(),
+                    namer: Default::default(),
+                    namer_model: String::new(),
+                    refs: RefsMode::Hand,
+                    install: InstallMode::Off,
+                },
+            )
+            .unwrap();
+            let map: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(
+                map["coverage"]
+                    .get("build_output_mirror")
+                    .and_then(|value| value.as_u64()),
+                count
+            );
+        }
+    }
+
     /// Issue #101's actual dify shape: `exports` maps a subpath to a
     /// generated file that source collection never parses (`generated` is in
     /// `MULTI_SKIP_DIR`), and the package has no other parsed file at all --
@@ -8292,6 +8665,7 @@ mod tests {
             directed: BTreeMap::new(),
             fanin: [(1, 1.0)].into_iter().collect(),
             uses: BTreeSet::new(),
+            build_output_mirrors: BTreeMap::new(),
             module_for: [
                 ("shared.txt".to_owned(), "shared.txt".to_owned()),
                 ("only_go.txt".to_owned(), "only_go.txt".to_owned()),
@@ -8311,6 +8685,7 @@ mod tests {
             directed: BTreeMap::new(),
             fanin: BTreeMap::new(),
             uses: BTreeSet::new(),
+            build_output_mirrors: BTreeMap::new(),
             module_for: [("shared.txt".to_owned(), "shared".to_owned())]
                 .into_iter()
                 .collect(),
