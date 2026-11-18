@@ -2785,6 +2785,75 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_result_over_the_lease_name_limit_fails_before_any_put() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut context, _received) = job_context(dir.path(), port);
+        context.hold = Duration::from_millis(100);
+        let job_dir = dir.path().join("job");
+        let output_dir = job_dir.join("output");
+        let symbols_dir = output_dir.join("demo.symbols");
+        std::fs::create_dir_all(&symbols_dir).unwrap();
+        let map = output_dir.join("demo.json");
+        let symbols = output_dir.join("demo.symbols.json");
+        std::fs::write(&map, EARLY_MAP).unwrap();
+        std::fs::write(&symbols, b"{}").unwrap();
+        for n in 0..10_001 {
+            std::fs::write(symbols_dir.join(format!("{n}.json")), b"{}").unwrap();
+        }
+        let executed = Executed {
+            job_dir,
+            output_dir: output_dir.clone(),
+            checkout: super::super::clone::Materialized {
+                path: dir.path().join("repo"),
+                commit: context.job.commit.clone(),
+                branch: Some("main".to_owned()),
+            },
+            output: executor::WorkerOutput {
+                map_path: map.to_string_lossy().into_owned(),
+                symbols_path: symbols.to_string_lossy().into_owned(),
+                symbols_dir: symbols_dir.to_string_lossy().into_owned(),
+                names_cache: output_dir
+                    .join("demo.names.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                commit: context.job.commit.clone(),
+                lang: "py".to_owned(),
+                files: 1,
+                districts: 1,
+                modularity: 0.0,
+            },
+        };
+        // Start the mock after preparing the files. Without the totals
+        // check it answers the first PUT with 413, so even the expected
+        // error code alone cannot make this regression test pass.
+        let server = std::thread::spawn(move || serve_413(listener, Duration::from_millis(100)));
+        let probe = AgentProbe {
+            cancel: context.cancel.clone(),
+            child: context.child.clone(),
+        };
+        let outcome = context.upload(
+            &http_agent(&context.endpoint),
+            Uuid::parse_str(&context.job_id).unwrap(),
+            &executed,
+            &probe,
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            0,
+            "an over-limit result must send no PUT"
+        );
+        match outcome {
+            Outcome::Failed(error) => {
+                assert_eq!(error.error, "invalid_worker_result", "{}", error.message);
+                assert!(error.message.contains("10000"), "{}", error.message);
+            }
+            _ => panic!("an over-limit result must fail the job"),
+        }
+    }
+
+    #[test]
     fn an_agent_rejects_a_names_cache_over_its_shared_cap_before_the_put() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
