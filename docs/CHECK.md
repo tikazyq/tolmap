@@ -22,19 +22,14 @@ tolmap check <repo> --base <ref> [--head <ref>] [--base-map <map.json>]
 
 ## Default thresholds
 
-**With no threshold flag the check applies `--max-districts 4 --max-dq 0.01`.** Both are absolute: neither scales with the size of the repository.
+**With no threshold flag the check applies `--max-districts 4 --max-dq 0.0001`.** Both are absolute thresholds independent of repository size.
 
 - **Flags replace the defaults as a set.** Pass either threshold flag and only the flags you pass apply. `--max-dq 0.002` alone checks Δq and nothing else; no default mixes in.
 - **`--report-only` applies none.** That is the behaviour the check had before the defaults existed.
 - **The report says which applied.** `thresholds.source` is `default`, `flags` or `report_only`.
 
-The defaults come from replaying 600 real commits through the check on GitHub Actions: the last 200 first-parent commits of django, prometheus and vuejs/core at their corpus pins (docs/FINDINGS.md finding 60, `remote-build.yml` `command=check-calibrate`). On those commits they would have failed 2, 2 and 1 of the 200, every one of them a change that crossed 5 or more districts.
-
-- **`--max-districts 4`** sits above every repository's p99 (4, 3 and 3) and below a clear knee: above 4, the sample holds one commit at 5 and four at 7.
-- **Absolute, not a share of the map.** The three maps have 11–15, 11–14 and 6–8 districts, yet their tails are the same in absolute terms. A share of the map's districts would fire most on the map with the fewest.
-- **`--max-dq 0.01`** is set above a noise floor. Δq moves even on commits that change no file on the map, because the head's co-change history is one commit longer; on django that drift reached −0.0042. Below the floor, Δq cannot tell a small real coupling change from drift. 0.01 sits in the knee of django's tail (−0.0173, then −0.0059). In the sample it fires on one commit alone, and that commit also crossed 7 districts.
-
-Read a Δq failure with that floor in mind. A drop of a few thousandths can come from history rather than from the diff.
+- **`--max-districts 4`** comes from replaying 600 real commits on GitHub Actions (docs/FINDINGS.md finding 60). It is at or above the 99th percentile for django, prometheus and vuejs/core (4, 3 and 3). Of the 600 commits, one crossed 5 districts and four crossed 7.
+- **`--max-dq 0.0001`** sits between the largest measured drop without a new cross-district edge and the smallest measured drop from a new cross-district import when co-change is held at base.
 
 ## Exit codes
 
@@ -52,13 +47,13 @@ On 2 and 3 nothing is printed on stdout; the reason is on stderr. Consumers depe
 The check builds two graphs, one for base and one for head. Each goes through the stages a map build runs before partitioning, with the build's defaults:
 
 1. **Detection** runs on the base checkout. At low confidence it is refused, as the service refuses it. The source it picks is extracted on both sides, so the two graphs describe the same codebase.
-2. **Extraction.**
+2. **Extraction.** Each side gets imports, symbol uses, identifiers and paths from its own tree. Both use the same co-change observations and weights from the base revision. The head credits renamed files under their head paths.
 3. **Blend and prune:** mass-normalised blending (finding 1) and the `node-relative` prune.
 
 This is the graph the partitioner sees. The base partition `P` is the base map's district of every file.
 
 - **`districts_crossed`**: the number of distinct base districts that hold a changed file. A changed file is one that `git diff --name-status -M` reports as added, modified, deleted or renamed, plus untracked files when head is the working tree. A modified or deleted file counts in its base district, and a renamed file in the base district of its old path. A new file is **placed** in the district that holds the plurality of its resolved imports' targets. Each target is weighted by the blended weight of its edge before pruning, and a tie goes to the lowest district id. A new file with no resolved import into a base district is **unplaced**. It counts toward no district and is listed in `unplaced_files`, never guessed. Changed files that the map does not index (docs, tests, other languages) are ignored.
-- **`delta_q`**: `Q(P, G_head) − Q(P, G_base)`. `P` is the base partition extended with the placed new files, and it is the same on both sides; only the graph changes, and nothing is re-partitioned. A negative `delta_q` means the change couples districts to each other more than it couples files within them.
+- **`delta_q`**: `Q(P, G_head) − Q(P, G_base)`, with co-change held at the base revision. `P` is the base partition extended with the placed new files and used on both sides. A docs-only commit gives zero `delta_q`, equal modularity on both sides and empty edge lists. A negative `delta_q` means the change couples districts to each other more than it couples files within them.
   - **`Q`** is the partition stage's own objective: weighted modularity with the configuration null model, at the build's resolution γ = 1.1. That is `Q = Σ_c [ w_c / m − γ (K_c / 2m)² ]`, where `m` is the total edge weight, `w_c` the weight inside district `c`, and `K_c` the summed weighted degree of its files.
   - **Files that leave the partition.** Deleted files drop out of both sides, together with their edges. Unplaced files drop out of the head side.
   - **Not the map's `q`.** `Q` is not comparable with the map's `q`, which is reported topology-only (unweighted, γ = 1) on the partition before small districts are merged.
@@ -75,7 +70,7 @@ This is the graph the partitioner sees. The base partition `P` is the base map's
 
 ## The base map
 
-Without `--base-map`, `tolmap check` checks `--base` out into a temporary `git worktree` and builds its map there, cold, the way `tolmap build` would. It uses the same detection, resolution, prune and namer as `tolmap build`, but draws no parcels, since parcels never change membership. The worktree is used with hooks off and is removed afterwards. The user's checkout is never touched, and neither is its index. A worktree is used rather than an archive because extraction's co-change signal reads the checkout's own `git log`. A second worktree holds `--head` when it is given.
+Without `--base-map`, `tolmap check` checks `--base` out into a temporary `git worktree` and builds its map there, cold, the way `tolmap build` would. It uses the same detection, resolution, prune and namer as `tolmap build`, but draws no parcels, since parcels never change membership. The worktree is used with hooks off and is removed afterwards. The user's checkout is never touched, and neither is its index. The check reads co-change from the base commit's `git log`. A second worktree provides the source files for `--head` when it is given.
 
 With `--base-map`, the stored map supplies the partition, and the base graph is still extracted, because a map keeps no edge weights. The map document records no commit (docs/ARCHITECTURE.md: the compact schema has no commit field). The service store records it in the file name, `<cache_dir>/maps/<owner>/<repo>/<commit>.json`, and so does the check:
 
@@ -114,9 +109,9 @@ Any other name exits 2 rather than trusting an unverified map. A map from the se
 
 The text format starts with three lines: districts crossed, Δq and the verdict. Then comes the edge list: added (`+`) and removed (`−`) cross-district edges merged, heaviest first, with at most 20 shown. Then come context lines for unplaced files and touched landmarks, and last the lower-bound note. JSON lists every edge.
 
-## Examples
+## Historical examples
 
-Both examples are real output, not illustrations. They come from GitHub Actions ([remote-build run 36324295341](https://github.com/onsager-ai/tolmap/actions/runs/36324295341), `command=check`, `extra_args=--base HEAD~30`). The repository is django at its corpus pin `dd6f6b1` (the working tree), checked against 30 commits earlier (`5f0293b`), under the default thresholds.
+These examples show GitHub Actions output from before co-change was held at base and `--max-dq` defaulted to `0.0001`. The repository is django at its corpus pin `dd6f6b1` (the working tree), checked against 30 commits earlier (`5f0293b`). See [remote-build run 36324295341](https://github.com/onsager-ai/tolmap/actions/runs/36324295341).
 
 Three things in them are worth reading closely:
 

@@ -8,8 +8,9 @@
 //! co-change signal agrees with the imports and directories: nothing here
 //! should leave Leiden a reason to merge two packages into one district.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
@@ -240,7 +241,7 @@ fn an_in_district_edit_crosses_one_district_and_leaves_q_alone() {
     assert_eq!(report["verdict"], "pass");
     assert_eq!(
         report["thresholds"],
-        serde_json::json!({"max_districts": 4, "max_dq": 0.01, "source": "default"}),
+        serde_json::json!({"max_districts": 4, "max_dq": 0.0001, "source": "default"}),
         "no threshold flag: the calibrated defaults apply"
     );
     assert_eq!(report["lower_bound"], true);
@@ -263,7 +264,7 @@ fn an_in_district_edit_crosses_one_district_and_leaves_q_alone() {
     assert!(lines[1].starts_with("delta q: +0.000000"), "{}", run.stdout);
     assert_eq!(
         lines[2],
-        "verdict: pass (districts 1 <= 4, delta q +0.000000 >= -0.010000; default thresholds)",
+        "verdict: pass (districts 1 <= 4, delta q +0.000000 >= -0.000100; default thresholds)",
         "{}",
         run.stdout
     );
@@ -275,6 +276,80 @@ fn an_in_district_edit_crosses_one_district_and_leaves_q_alone() {
         "{}",
         run.stdout
     );
+}
+
+#[test]
+fn a_docs_only_commit_leaves_q_and_edges_alone_at_the_history_window_limit() {
+    let (_dir, repo, _) = fixture();
+    // Each first pair now meets the co-change minimum of three observations.
+    // Sliding the window past the first billing commit would drop that pair.
+    for (package, _) in PACKAGES {
+        touch(&repo, package, 0);
+        touch(&repo, package, 1);
+        git(&repo, &["commit", "-qam", &format!("retune {package}")]);
+    }
+    let tip = git(&repo, &["rev-parse", "HEAD"]);
+    let count: usize = git(&repo, &["rev-list", "--count", "HEAD"])
+        .parse()
+        .unwrap();
+    // Fast-import pads the history in one git process without changing its tree.
+    let mut child = Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(&repo)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    write!(stdin, "reset refs/heads/window\nfrom {tip}\n\n").unwrap();
+    for _ in count..4000 {
+        stdin
+            .write_all(
+                b"commit refs/heads/window\ncommitter test <test@example.com> 1 +0000\ndata 0\n\n",
+            )
+            .unwrap();
+    }
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    git(&repo, &["switch", "-q", "window"]);
+    assert_eq!(git(&repo, &["rev-list", "--count", "HEAD"]), "4000");
+
+    write(&repo, "README.md", "# Town\n");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-qm", "document the project"]);
+    let run = check(
+        &repo,
+        &["--base", "HEAD^", "--head", "HEAD", "--format", "json"],
+    );
+    expect_code(&run, 0);
+    let report = run.json();
+    assert_eq!(report["districts_crossed"], 0, "{report:#}");
+    assert_eq!(report["delta_q"].as_f64(), Some(0.0), "{report:#}");
+    assert_eq!(report["modularity_base"], report["modularity_head"]);
+    assert!(report["edges_added"].as_array().unwrap().is_empty());
+    assert!(report["edges_removed"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn a_second_cross_district_co_edit_leaves_q_and_edges_alone() {
+    let (_dir, repo, _) = fixture();
+    // These files have only their initial commits in history. The second
+    // co-edit would satisfy both co-change minima if counted on the head side.
+    touch(&repo, "billing", 4);
+    touch(&repo, "catalog", 2);
+    git(&repo, &["commit", "-qam", "tune tax and stock"]);
+    git(&repo, &["revert", "--no-edit", "HEAD"]);
+
+    let run = check(
+        &repo,
+        &["--base", "HEAD^", "--head", "HEAD", "--format", "json"],
+    );
+    expect_code(&run, 0);
+    let report = run.json();
+    assert_eq!(report["districts_crossed"], 2, "{report:#}");
+    assert_eq!(report["delta_q"].as_f64(), Some(0.0), "{report:#}");
+    assert_eq!(report["modularity_base"], report["modularity_head"]);
+    assert!(report["edges_added"].as_array().unwrap().is_empty());
+    assert!(report["edges_removed"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -365,8 +440,7 @@ fn a_new_cross_district_import_lowers_q_and_fails_only_past_max_dq() {
 #[test]
 fn the_default_thresholds_fail_a_heavy_coupling_change_without_any_flag() {
     let (_dir, repo, base) = fixture();
-    // billing's invoice imports every module of the two other packages: on
-    // a graph this small, far more cross-district weight than 0.01 of q.
+    // Billing's invoice imports every module of the two other packages.
     let modules = PACKAGES[0].1;
     let mut source = module_source("billing", &modules, 0, 1);
     let mut uses = String::new();
@@ -384,7 +458,7 @@ fn the_default_thresholds_fail_a_heavy_coupling_change_without_any_flag() {
     expect_code(&run, 1);
     let report = run.json();
     assert!(
-        report["delta_q"].as_f64().unwrap() < -0.01,
+        report["delta_q"].as_f64().unwrap() < -0.0001,
         "the change must drop q past the default: {report:#}"
     );
     assert_eq!(report["verdict"], "fail");

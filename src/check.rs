@@ -8,9 +8,10 @@
 //!   never guessed.
 //! - **Δq**: `Q(P, G_head) - Q(P, G_base)`, with `P` the base map's
 //!   partition (extended with the placed new files) held fixed and only the
-//!   graph changing. Nothing is re-partitioned: a Leiden run would move with
-//!   its own seed and cost minutes, and it would measure the new partition
-//!   rather than what the diff did to the old one.
+//!   graph changing. Both graphs use the base's co-change history. Nothing
+//!   is re-partitioned: a Leiden run would move with its own seed and cost
+//!   minutes, and it would measure the new partition rather than what the
+//!   diff did to the old one.
 //!
 //! Both graphs come from the same stages a map build runs up to the
 //! partitioner -- detection (on the base checkout), extraction, then blend
@@ -28,8 +29,8 @@
 //!
 //! The user's checkout is never touched: base (and `--head`, when given) are
 //! checked out into temporary `git worktree`s, with hooks off, and removed
-//! afterwards. A worktree rather than `git archive` because extraction's
-//! co-change signal reads the checkout's own `git log`.
+//! afterwards. The base worktree supplies both the source files and the
+//! git history used by the check.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -40,7 +41,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::detect::{self, Confidence};
-use crate::extract::{self, round_to, InstallMode, LanguageKind, RefsMode};
+use crate::extract::{
+    self, round_to, GitHistory, HistorySource, InstallMode, LanguageKind, RefsMode,
+};
 use crate::geometry::{self, BuildFeatures};
 use crate::naming::{self, NamerKind};
 use crate::pipeline::{self, PruneVariant};
@@ -80,13 +83,9 @@ const TOUCHED_LANDMARKS: [&str; 2] = ["bridge", "hazard"];
 pub const DEFAULT_MAX_DISTRICTS: usize = 4;
 
 /// The default `--max-dq`, applied when no threshold flag is given.
-/// Calibrated with [`DEFAULT_MAX_DISTRICTS`] (finding 60). `delta_q` moves
-/// on commits that change no file on the map, because the head's co-change
-/// history is one commit longer: that drift reached -0.004191 on django.
-/// The default sits above it, in the knee of django's tail (-0.017309, then
-/// -0.005940), and fires on 1, 0 and 0 of the 200 commits alone; every
-/// commit it fires on there also crossed more than 4 districts.
-pub const DEFAULT_MAX_DQ: f64 = 0.01;
+/// With co-change held at base, this sits between the largest measured
+/// drop without a new cross-district edge and the smallest from a new import.
+pub const DEFAULT_MAX_DQ: f64 = 0.0001;
 
 pub const LOWER_BOUND_NOTE: &str = "numbers are a lower bound: tolmap's graph holds only the references it can resolve (calls through variables, dynamic imports and reflection are missed), so the change couples at least this much";
 
@@ -255,7 +254,7 @@ pub fn run(options: &CheckOptions) -> Result<CheckReport, CheckError> {
         source.0
     );
     let stage = Instant::now();
-    let base_graph = extract_graph(&base_dir, &source)?;
+    let (base_graph, history) = extract_graph(&base_dir, &source, HistorySource::Revision(&base))?;
     let base_graph_s = stage.elapsed().as_secs_f64();
     let stage = Instant::now();
     let base_map = match supplied_map {
@@ -274,7 +273,18 @@ pub fn run(options: &CheckOptions) -> Result<CheckReport, CheckError> {
         )));
     }
     let stage = Instant::now();
-    let head_graph = extract_graph(&head_dir, &source)?;
+    let renames = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Renamed { from, to } => Some((from.as_str(), to.as_str())),
+            _ => None,
+        })
+        .collect();
+    let (head_graph, _) = extract_graph(
+        &head_dir,
+        &source,
+        HistorySource::Frozen(history.follow_renames(&renames)),
+    )?;
     let head_graph_s = stage.elapsed().as_secs_f64();
     drop(scratch);
 
@@ -1150,8 +1160,12 @@ fn detect_source(dir: &Path) -> Result<(String, LanguageKind), CheckError> {
     Ok((chosen.pkg, chosen.language))
 }
 
-fn extract_graph(dir: &Path, source: &(String, LanguageKind)) -> Result<GraphData, CheckError> {
-    extract::build_multi_source_with_refs(dir, std::slice::from_ref(source), RefsMode::default())
+fn extract_graph(
+    dir: &Path,
+    source: &(String, LanguageKind),
+    history: HistorySource<'_>,
+) -> Result<(GraphData, GitHistory), CheckError> {
+    extract::build_check_graph(dir, source, history)
         .map_err(|error| internal(error.context(format!("extract {}", dir.display()))))
 }
 

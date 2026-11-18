@@ -470,6 +470,7 @@ pub fn build_multi_source_with_progress(
         RefsMode::Hand,
         &InstallMode::Off,
         progress,
+        HistorySource::Revision("HEAD"),
     )?
     .0)
 }
@@ -492,8 +493,26 @@ pub fn build_multi_source_with_refs(
         refs,
         &InstallMode::Off,
         &crate::progress::Progress::silent(),
+        HistorySource::Revision("HEAD"),
     )?
     .0)
+}
+
+pub(crate) fn build_check_graph(
+    repo: &Path,
+    source: &(String, LanguageKind),
+    history: HistorySource<'_>,
+) -> Result<(GraphData, GitHistory)> {
+    let (graph, _, history) = build_multi_source_inner(
+        repo,
+        std::slice::from_ref(source),
+        false,
+        RefsMode::default(),
+        &InstallMode::Off,
+        &crate::progress::Progress::silent(),
+        history,
+    )?;
+    Ok((graph, history))
 }
 
 pub(crate) fn build_with_symbols(
@@ -501,13 +520,14 @@ pub(crate) fn build_with_symbols(
     pkg: &str,
     language: LanguageKind,
 ) -> Result<(GraphData, crate::symbols::SymbolSpool)> {
-    let (graph, spool) = build_multi_source_inner(
+    let (graph, spool, _) = build_multi_source_inner(
         repo,
         &[(pkg.to_owned(), language)],
         true,
         RefsMode::Hand,
         &InstallMode::Off,
         &crate::progress::Progress::silent(),
+        HistorySource::Revision("HEAD"),
     )?;
     Ok((graph, spool.expect("symbol collection requested")))
 }
@@ -520,13 +540,14 @@ pub(crate) fn build_with_symbols_progress(
     install: &InstallMode,
     progress: &crate::progress::Progress,
 ) -> Result<(GraphData, crate::symbols::SymbolSpool)> {
-    let (graph, spool) = build_multi_source_inner(
+    let (graph, spool, _) = build_multi_source_inner(
         repo,
         &[(pkg.to_owned(), language)],
         true,
         refs,
         install,
         progress,
+        HistorySource::Revision("HEAD"),
     )?;
     Ok((graph, spool.expect("symbol collection requested")))
 }
@@ -535,13 +556,14 @@ pub(crate) fn build_multi_source_with_symbols(
     repo: &Path,
     sources: &[(String, LanguageKind)],
 ) -> Result<(GraphData, crate::symbols::SymbolSpool)> {
-    let (graph, spool) = build_multi_source_inner(
+    let (graph, spool, _) = build_multi_source_inner(
         repo,
         sources,
         true,
         RefsMode::Hand,
         &InstallMode::Off,
         &crate::progress::Progress::silent(),
+        HistorySource::Revision("HEAD"),
     )?;
     Ok((graph, spool.expect("symbol collection requested")))
 }
@@ -553,7 +575,15 @@ pub(crate) fn build_multi_source_with_symbols_progress(
     install: &InstallMode,
     progress: &crate::progress::Progress,
 ) -> Result<(GraphData, crate::symbols::SymbolSpool)> {
-    let (graph, spool) = build_multi_source_inner(repo, sources, true, refs, install, progress)?;
+    let (graph, spool, _) = build_multi_source_inner(
+        repo,
+        sources,
+        true,
+        refs,
+        install,
+        progress,
+        HistorySource::Revision("HEAD"),
+    )?;
     Ok((graph, spool.expect("symbol collection requested")))
 }
 
@@ -564,7 +594,8 @@ fn build_multi_source_inner(
     refs: RefsMode,
     install: &InstallMode,
     progress: &crate::progress::Progress,
-) -> Result<(GraphData, Option<crate::symbols::SymbolSpool>)> {
+    history: HistorySource<'_>,
+) -> Result<(GraphData, Option<crate::symbols::SymbolSpool>, GitHistory)> {
     let started = Instant::now();
     let mut symbol_collection = Duration::ZERO;
     let mut collect_steps = crate::symbols::CollectTimings::default();
@@ -652,7 +683,7 @@ fn build_multi_source_inner(
         }
     };
     let graph_started = Instant::now();
-    let mut graph = finish_graph(repo, merged, progress)?;
+    let (mut graph, history) = finish_graph(repo, merged, progress, history)?;
     graph.references = references;
     graph_time += graph_started.elapsed();
     let total = started.elapsed();
@@ -678,7 +709,7 @@ fn build_multi_source_inner(
     }
     progress.log(format!("phase graph: {:.3}s", graph_time.as_secs_f64()));
     progress.log(format!("phase extract_total: {:.3}s", total.as_secs_f64()));
-    Ok((graph, spool))
+    Ok((graph, spool, history))
 }
 
 /// Parses every source file `source_files` finds for `(pkg, language)` under
@@ -6342,7 +6373,8 @@ fn finish_graph(
     repo: &Path,
     merged: MergedSources,
     progress: &crate::progress::Progress,
-) -> Result<GraphData> {
+    history: HistorySource<'_>,
+) -> Result<(GraphData, GitHistory)> {
     let MergedSources {
         parsed,
         files,
@@ -6359,10 +6391,16 @@ fn finish_graph(
         python_cross_project,
     } = merged;
 
-    let history_stage = progress.stage(crate::progress::StageId::History, None);
-    let history = git_history(repo, &files, 4000, &history_stage)?;
-    history_stage.set(history.commits as u64);
-    history_stage.finish();
+    let history = match history {
+        HistorySource::Revision(revision) => {
+            let history_stage = progress.stage(crate::progress::StageId::History, None);
+            let history = git_history(repo, revision, &files, 4000, &history_stage)?;
+            history_stage.set(history.commits as u64);
+            history_stage.finish();
+            history
+        }
+        HistorySource::Frozen(history) => history,
+    };
     let semantic = semantic_vectors(&parsed);
     let file_ids = files
         .iter()
@@ -6372,7 +6410,10 @@ fn finish_graph(
     let cochange = history
         .cochange
         .iter()
-        .map(|((a, b), &value)| ((file_ids[a.as_str()], file_ids[b.as_str()]), value))
+        .filter_map(|((a, b), &value)| {
+            let (&a, &b) = (file_ids.get(a.as_str())?, file_ids.get(b.as_str())?);
+            Some((ordered_file_pair(a, b), value))
+        })
         .collect::<BTreeMap<_, _>>();
     let mut candidates = static_edges.keys().copied().collect::<BTreeSet<_>>();
     candidates.extend(cochange.keys().copied());
@@ -6521,7 +6562,7 @@ fn finish_graph(
         .map(|(file, value)| (file.clone(), value.symbols.clone()))
         .collect();
 
-    Ok(GraphData {
+    let graph = GraphData {
         repo: repo
             .file_name()
             .unwrap_or_default()
@@ -6551,7 +6592,8 @@ fn finish_graph(
         references: None,
         build_output_mirror,
         python_cross_project,
-    })
+    };
+    Ok((graph, history))
 }
 
 /// The largest static edge value per language, floored at 1.0 -- see the
@@ -6662,15 +6704,49 @@ fn strip_quotes(value: &str) -> &str {
     value.trim_matches(['\'', '"'])
 }
 
+pub(crate) enum HistorySource<'a> {
+    Revision(&'a str),
+    Frozen(GitHistory),
+}
+
 #[derive(Default)]
-struct GitHistory {
+pub(crate) struct GitHistory {
     cochange: BTreeMap<(String, String), f64>,
     churn: BTreeMap<String, usize>,
     commits: usize,
 }
 
+impl GitHistory {
+    /// Carry the base's observations to head paths without counting the diff
+    /// itself, or changing pair weights when the head drops a file.
+    pub(crate) fn follow_renames(mut self, renames: &BTreeMap<&str, &str>) -> Self {
+        if renames.is_empty() {
+            return self;
+        }
+        let rename = |path: String| match renames.get(path.as_str()) {
+            Some(&to) => to.to_owned(),
+            None => path,
+        };
+        self.cochange = self
+            .cochange
+            .into_iter()
+            .map(|((a, b), weight)| {
+                let (a, b) = (rename(a), rename(b));
+                (if a <= b { (a, b) } else { (b, a) }, weight)
+            })
+            .collect();
+        self.churn = self
+            .churn
+            .into_iter()
+            .map(|(path, count)| (rename(path), count))
+            .collect();
+        self
+    }
+}
+
 fn git_history(
     repo: &Path,
+    revision: &str,
     files: &[String],
     max_commits: usize,
     progress: &crate::progress::StageCounter,
@@ -6701,6 +6777,9 @@ fn git_history(
             // that renamed a file -- see the parity evidence in #32 for what
             // that does (or does not) change on the nine fixtures.
             "--no-renames",
+            "--end-of-options",
+            revision,
+            "--",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -6794,6 +6873,67 @@ pub(crate) fn round_to(value: f64, digits: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_history_reads_a_named_revision_and_carries_pairs_across_diff_renames() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(repo.path())
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {:?}", output);
+        };
+        let write = |file: &str, text: &str| fs::write(repo.path().join(file), text).unwrap();
+        git(&["init", "-q"]);
+        write("a.py", "a = 1\n");
+        write("b.py", "b = 1\n");
+        git(&["add", "a.py", "b.py"]);
+        git(&["commit", "-qm", "create pair"]);
+        write("a.py", "a = 2\n");
+        write("b.py", "b = 2\n");
+        git(&["commit", "-qam", "edit pair"]);
+        write("a.py", "a = 3\n");
+        git(&["commit", "-qam", "edit a"]);
+        write("b.py", "b = 3\n");
+        git(&["commit", "-qam", "edit b"]);
+        git(&["branch", "base"]);
+        git(&["mv", "a.py", "z.py"]);
+        write("b.py", "b = 4\n");
+        git(&["commit", "-qam", "rename a and edit b"]);
+
+        let progress = crate::progress::Progress::silent();
+        let stage = progress.stage(crate::progress::StageId::History, None);
+        let history = git_history(
+            repo.path(),
+            "base",
+            &["a.py".into(), "b.py".into()],
+            10,
+            &stage,
+        )
+        .unwrap()
+        .follow_renames(&BTreeMap::from([("a.py", "z.py")]));
+        assert_eq!(history.commits, 4);
+        assert_eq!(
+            history.churn,
+            BTreeMap::from([("b.py".into(), 3), ("z.py".into(), 3)])
+        );
+        assert_eq!(
+            history.cochange,
+            BTreeMap::from([(("b.py".into(), "z.py".into()), 2.0 / 3.0)])
+        );
+    }
 
     #[test]
     fn nested_python_package_anchors_on_last_source_segment() {
