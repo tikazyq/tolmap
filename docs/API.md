@@ -89,7 +89,22 @@ bundle (the default is `web/dist` relative to the launch directory). A missing
 bundle is a startup error. Web reuses the service's API-safe SPA/static handler
 and the existing React host composition; public admission/catalogue handlers
 are not mounted. `serve` and `local` remain separate until the retirement slice.
-No old stores are discovered or imported. Private GitHub acquisition is deferred.
+No old stores are discovered or imported. Personal GitHub acquisition supports
+public and private repositories. HEAD lookup, clone and fetch try anonymously
+first with helpers and prompts disabled. An access refusal or repository-not-found
+response triggers a credential retry under the account running `tolmap web`.
+The bridge asks that account's Git credential helper, then falls back to GitHub
+CLI authentication if the helper supplies no credential. The GitHub CLI provider
+receives `GH_TOKEN`, `GITHUB_TOKEN` and `GH_HOST` if set. Each provider has a
+15-second deadline.
+
+Credentials travel through the Git helper's stdin and stdout. Tolmap does not
+persist credentials, forward provider diagnostics to jobs, or ask helpers to
+store or erase credentials. If access is missing or revoked, the job reports a
+fixed setup/access error and the last complete snapshot stays available. Private
+snapshots and their source are retained until the registration is removed. Off
+loopback, anyone who can reach the listener can read retained private source and
+trigger indexing with the server account's GitHub access.
 
 | Method and route | Personal behavior |
 | --- | --- |
@@ -98,7 +113,7 @@ No old stores are discovered or imported. Private GitHub acquisition is deferred
 | `POST /api/repositories/{id}/refresh` | Refresh committed HEAD through the same library as CLI; returns `202` with `job_id`. |
 | `DELETE /api/repositories/{id}` | Remove registration and tolmap-owned history/source; preserve the original checkout. Busy repositories must finish/cancel first. |
 | `GET /api/personal/scan?path=...` | Sorted checkout roots without following symlinks or entering discovered checkouts, using `OfferedRepository` rows and registered markers. Local rows do not display provider visibility. |
-| `POST /api/personal/index` | Existing `BatchIndexRequest` (`provider_ids` are local paths or anonymous GitHub source strings); returns `BatchIndexResponse`. Sources register before jobs start. |
+| `POST /api/personal/index` | Existing `BatchIndexRequest` (`provider_ids` are local paths or GitHub source strings); returns `BatchIndexResponse`. Sources register before jobs start. |
 | `GET /api/personal/batches/{id}` | Persisted `BatchProgress`; reloadable batch URL `/new/batches/{id}`. |
 | `GET /api/jobs/{id}` | Re-read durable `JobSnapshot`, including worker phase/progress and terminal errors. |
 | `POST /api/jobs/{id}/cancel` | Cancel queued work or stop its isolated indexer; completed maps remain available. |

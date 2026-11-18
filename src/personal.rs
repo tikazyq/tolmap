@@ -9,6 +9,15 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+mod github;
+
+const REMOTE_HEAD: &str = "refs/tolmap/remote-head";
+
+#[doc(hidden)]
+pub fn github_credential_helper(operation: &str) {
+    github::credential_helper(operation);
+}
+
 #[derive(Debug, Args)]
 pub struct AddArgs {
     #[arg(required_unless_present = "scan", conflicts_with = "scan")]
@@ -294,7 +303,12 @@ impl Library {
         drop(registry);
         Ok(repo)
     }
-    fn acquire(&self, repo: &Repository, fetch: bool) -> Result<PathBuf> {
+    fn acquire(
+        &self,
+        repo: &Repository,
+        fetch: bool,
+        remote_git: impl Fn(&Path, &[&str]) -> Result<Vec<u8>>,
+    ) -> Result<PathBuf> {
         if repo.kind == "local" {
             ensure!(
                 Path::new(&repo.location).is_dir(),
@@ -322,54 +336,39 @@ impl Library {
             }
         }
         let url = format!("https://{}.git", repo.location);
-        let mut observed = crate::source::git(&root);
-        observed.args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "core.askPass=",
-            "ls-remote",
-            "--symref",
-            "--",
-            &url,
-            "HEAD",
-        ]);
-        let observed = observed.output()?;
-        ensure!(
-            observed.status.success(),
-            "anonymous GitHub HEAD lookup failed for {}",
-            repo.location
-        );
-        let advertised = String::from_utf8(observed.stdout)?;
+        let advertised = remote_git(&root, &["ls-remote", "--symref", "--", &url, "HEAD"])?;
+        let advertised = String::from_utf8(advertised)?;
         let branch = advertised
             .lines()
             .find_map(|line| {
-                line.strip_prefix("ref: ")
-                    .and_then(|s| s.strip_suffix("\tHEAD"))
+                line.strip_prefix("ref: refs/heads/")?
+                    .strip_suffix("\tHEAD")
             })
             .context("GitHub default branch is unavailable")?;
         ensure!(
-            branch.starts_with("refs/heads/") && !branch.contains(char::is_whitespace),
+            !branch.is_empty() && !branch.contains(char::is_whitespace),
             "invalid GitHub default branch"
         );
-        let mut command = crate::source::git(&root);
-        command.args(["-c", "credential.helper=", "-c", "core.askPass="]);
         if path.exists() {
-            if !fetch {
-                return Ok(path);
-            }
-            command
-                .arg("-C")
-                .arg(&path)
-                .args(["fetch", "--no-tags", "origin", branch]);
+            let refspec = format!("+refs/heads/{branch}:{REMOTE_HEAD}");
+            remote_git(
+                &path,
+                &[
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--",
+                    &url,
+                    &refspec,
+                ],
+            )?;
         } else {
-            command
-                .args(["clone", "--no-checkout", "--"])
-                .arg(&url)
-                .arg(&path);
+            // Indexing and retained source must be able to read all objects offline.
+            remote_git(&root, &["clone", "--no-checkout", "--", &url, "checkout"])?;
+            let tracking = format!("refs/remotes/origin/{branch}^{{commit}}");
+            let head = git(&path, &["rev-parse", "--verify", &tracking])?;
+            git(&path, &["update-ref", REMOTE_HEAD, &head])?;
         }
-        let output = command.output()?;
-        ensure!(output.status.success(),"anonymous GitHub acquisition failed for {}; configure private GitHub access when that support is available",repo.location);
         Ok(path)
     }
     pub fn refresh(
@@ -387,6 +386,16 @@ impl Library {
         sources: &SourceArgs,
         control: Option<&crate::local::PersonalControl>,
     ) -> Result<PersonalSnapshot> {
+        self.refresh_with_remote(repo, commit, sources, control, github::remote_git)
+    }
+    fn refresh_with_remote(
+        &self,
+        repo: &Repository,
+        commit: Option<&str>,
+        sources: &SourceArgs,
+        control: Option<&crate::local::PersonalControl>,
+        remote_git: impl Fn(&Path, &[&str]) -> Result<Vec<u8>>,
+    ) -> Result<PersonalSnapshot> {
         let _guard = self.repo_lock(repo)?;
         let current = self
             .store
@@ -400,21 +409,8 @@ impl Library {
         self.store.personal_begin(&repo.id, &attempt)?;
         let result = (|| {
             ensure!(!control.is_some_and(|c| c.cancelled()), "cancelled");
-            let mut checkout = self.acquire(repo, commit.is_none())?;
+            let mut checkout = self.acquire(repo, commit.is_none(), remote_git)?;
             ensure!(!control.is_some_and(|c| c.cancelled()), "cancelled");
-            let revision = if repo.kind == "github" && commit.is_none() {
-                if checkout.join(".git/FETCH_HEAD").exists() {
-                    "FETCH_HEAD^{commit}"
-                } else {
-                    "refs/remotes/origin/HEAD^{commit}"
-                }
-            } else {
-                "HEAD^{commit}"
-            };
-            let observed = git(&checkout, &["rev-parse", revision])?;
-            if commit.is_none() {
-                self.store.observe(&repo.id, &observed)?;
-            }
             let selected = if let Some(commit) = commit {
                 ensure!(
                     !commit.is_empty() && commit.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -433,6 +429,16 @@ impl Library {
                 }
                 git(&checkout, &["rev-parse", "--verify", &revision])?
             } else {
+                let revision = if repo.kind == "github" {
+                    REMOTE_HEAD
+                } else {
+                    "HEAD"
+                };
+                let observed = git(
+                    &checkout,
+                    &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+                )?;
+                self.store.observe(&repo.id, &observed)?;
                 observed
             };
             let selection = serde_json::to_value(sources)?;
