@@ -9,8 +9,8 @@ use clap::Args;
 use sha2::{Digest, Sha256};
 
 use crate::query_contract::{
-    Direction, MapIdentity, Query, QueryCoverage, QueryEnvelope, QueryResponse, QueryResult,
-    QuerySymbol, ReferenceMode, QUERY_SCHEMA,
+    DependencyDirectionCounts, DependencyDirections, Direction, MapIdentity, Query, QueryCoverage,
+    QueryEnvelope, QueryResponse, QueryResult, QuerySymbol, ReferenceMode, QUERY_SCHEMA,
 };
 use crate::schema::{MapDocument, SymbolsDocument};
 
@@ -21,7 +21,7 @@ pub struct QueryOptions {
     pub map: PathBuf,
     #[arg(long, default_value = "json", value_parser = ["json", "text"])]
     pub format: String,
-    /// Maximum result rows (route: file steps); default 25, overview: all districts.
+    /// Maximum rows (per direction for deps); default 25, overview: all districts.
     #[arg(long)]
     pub limit: Option<usize>,
 }
@@ -176,9 +176,19 @@ impl Snapshot {
         limit: usize,
         mut results: Vec<QueryResult>,
         symbols: Option<&SymbolsDocument>,
+        directions: Option<DependencyDirections>,
     ) -> QueryResponse {
-        let total = results.len();
-        results.truncate(limit);
+        let (total, full_limit) = if let Some(directions) = &directions {
+            let incoming = directions.incoming.map_or(0, |counts| counts.total);
+            let outgoing = directions.out.map_or(0, |counts| counts.total);
+            (incoming + outgoing, incoming.max(outgoing))
+        } else {
+            let total = results.len();
+            results.truncate(limit);
+            (total, total)
+        };
+        let returned = results.len();
+        let omitted = total - returned;
         QueryEnvelope {
             schema: QUERY_SCHEMA.into(),
             query,
@@ -186,9 +196,11 @@ impl Snapshot {
             coverage: self.coverage(symbols),
             limit,
             total,
-            truncated: total > limit,
-            omitted: total.saturating_sub(limit),
-            next_limit: (total > limit).then_some(total),
+            returned,
+            truncated: omitted > 0,
+            omitted,
+            next_limit: (omitted > 0).then_some(full_limit),
+            directions,
             results,
         }
     }
@@ -206,6 +218,7 @@ impl Snapshot {
                     district: self.district(file),
                     symbol: None,
                 }],
+                None,
                 None,
             ));
         }
@@ -312,6 +325,7 @@ impl Snapshot {
             limit,
             results,
             symbols.as_ref(),
+            None,
         ))
     }
 
@@ -355,6 +369,7 @@ impl Snapshot {
             limit,
             results,
             None,
+            None,
         )
     }
 
@@ -390,6 +405,7 @@ impl Snapshot {
             limit,
             results,
             None,
+            None,
         )
     }
 
@@ -398,25 +414,35 @@ impl Snapshot {
         if let Some(file) = self.map.files.iter().position(|p| p == path) {
             for &[a, b] in &self.map.edges {
                 if a == file && direction != Direction::In {
-                    hits.insert((self.map.files[b].clone(), 1u8, b));
+                    hits.insert((&self.map.files[b], true, b));
                 }
                 if b == file && direction != Direction::Out {
-                    hits.insert((self.map.files[a].clone(), 0u8, a));
+                    hits.insert((&self.map.files[a], false, a));
                 }
             }
         }
-        let results = hits
-            .into_iter()
-            .map(|(path, d, file)| QueryResult::Dependency {
-                path,
-                district: self.district(file),
-                direction: if d == 0 {
-                    Direction::In
-                } else {
-                    Direction::Out
-                },
-            })
-            .collect();
+        let mut incoming = DependencyDirectionCounts::default();
+        let mut outgoing = DependencyDirectionCounts::default();
+        let mut results = Vec::new();
+        // The set sorts by path, with incoming (false) before outgoing at a tie.
+        for (path, outbound, file) in hits {
+            let (counts, direction) = if outbound {
+                (&mut outgoing, Direction::Out)
+            } else {
+                (&mut incoming, Direction::In)
+            };
+            counts.total += 1;
+            if counts.returned < limit {
+                counts.returned += 1;
+                results.push(QueryResult::Dependency {
+                    path: path.clone(),
+                    district: self.district(file),
+                    direction,
+                });
+            } else {
+                counts.omitted += 1;
+            }
+        }
         self.response(
             Query::Deps {
                 path: path.into(),
@@ -425,6 +451,10 @@ impl Snapshot {
             limit,
             results,
             None,
+            Some(DependencyDirections {
+                incoming: (direction != Direction::Out).then_some(incoming),
+                out: (direction != Direction::In).then_some(outgoing),
+            }),
         )
     }
 }
@@ -464,7 +494,25 @@ pub fn text(report: &QueryResponse) -> String {
         report.total,
         if report.truncated { " (truncated)" } else { "" }
     );
-    if let Some(n) = report.next_limit {
+    if let Some(directions) = &report.directions {
+        for (label, counts) in [
+            ("in (importers)", directions.incoming),
+            ("out (imports)", directions.out),
+        ] {
+            if let Some(counts) = counts {
+                out.push_str(&format!(
+                    "{label}: {} of {} results\n",
+                    counts.returned, counts.total
+                ));
+                if counts.omitted > 0 {
+                    out.push_str(&format!(
+                        "{label}: {} rows omitted; repeat with --limit {} to return all rows in this direction\n",
+                        counts.omitted, counts.total
+                    ));
+                }
+            }
+        }
+    } else if let Some(n) = report.next_limit {
         out.push_str(&format!(
             "{} rows omitted; repeat with --limit {n} to return all rows\n",
             report.omitted

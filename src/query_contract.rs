@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-pub const QUERY_SCHEMA: &str = "tolmap.query/v2";
+pub const QUERY_SCHEMA: &str = "tolmap.query/v3";
 
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
 pub struct QueryEnvelope<T, M = MapIdentity> {
@@ -15,10 +15,28 @@ pub struct QueryEnvelope<T, M = MapIdentity> {
     pub coverage: QueryCoverage,
     pub limit: usize,
     pub total: usize,
+    pub returned: usize,
     pub truncated: bool,
     pub omitted: usize,
     pub next_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub directions: Option<DependencyDirections>,
     pub results: Vec<T>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, TS)]
+pub struct DependencyDirectionCounts {
+    pub total: usize,
+    pub returned: usize,
+    pub omitted: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+pub struct DependencyDirections {
+    #[serde(rename = "in")]
+    pub incoming: Option<DependencyDirectionCounts>,
+    pub out: Option<DependencyDirectionCounts>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]

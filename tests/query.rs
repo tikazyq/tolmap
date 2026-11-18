@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
+use serde_json::json;
 use tolmap::query::Snapshot;
-use tolmap::query_contract::{Direction, Query, QueryResult, QUERY_SCHEMA};
+use tolmap::query_contract::{Direction, Query, QueryResult};
 
 fn fixture(name: &str) -> Snapshot {
     Snapshot::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("data/{name}.json")))
@@ -12,7 +14,7 @@ fn fixture(name: &str) -> Snapshot {
 fn pinned_file_symbol_and_ambiguity() {
     let s = fixture("tolmap");
     let file = s.where_is("src/main.rs", 8).unwrap();
-    assert_eq!(file.schema, QUERY_SCHEMA);
+    assert_eq!(file.schema, "tolmap.query/v3");
     assert_eq!(file.total, 1);
     assert_eq!(file.map.sha256.len(), 64);
     assert!(file.map.commit.is_none());
@@ -37,50 +39,124 @@ fn pinned_file_symbol_and_ambiguity() {
 }
 
 #[test]
-fn pinned_deps_match_all_edges_and_keep_total() {
-    for name in ["tolmap", "flask"] {
-        let s = fixture(name);
-        let path = &s.map.files[1];
+fn pinned_deps_match_all_edges_and_limit_each_direction() {
+    let s = fixture("tolmap");
+    for (path, in_total, out_total) in [("src/progress.rs", 14, 2), ("src/geometry.rs", 2, 10)] {
+        let file = s.map.files.iter().position(|p| p == path).unwrap();
+        let importers: BTreeSet<_> = s
+            .map
+            .edges
+            .iter()
+            .filter(|&&[_, b]| b == file)
+            .map(|&[a, _]| s.map.files[a].as_str())
+            .collect();
+        let imports: BTreeSet<_> = s
+            .map
+            .edges
+            .iter()
+            .filter(|&&[a, _]| a == file)
+            .map(|&[_, b]| s.map.files[b].as_str())
+            .collect();
+        assert_eq!((importers.len(), imports.len()), (in_total, out_total));
         for direction in [Direction::In, Direction::Out, Direction::Both] {
-            let report = s.deps(path, direction, 1);
-            let expected: std::collections::BTreeSet<_> = s
-                .map
-                .edges
-                .iter()
-                .flat_map(|&[a, b]| {
-                    let mut rows = Vec::new();
-                    if a == 1 && direction != Direction::In {
-                        rows.push((b, 1));
-                    }
-                    if b == 1 && direction != Direction::Out {
-                        rows.push((a, 0));
-                    }
-                    rows
-                })
-                .collect();
-            assert_eq!(report.total, expected.len());
-            assert_eq!(report.truncated, expected.len() > 1);
-            assert_eq!(report.omitted, expected.len().saturating_sub(1));
-            assert_eq!(
-                report.next_limit,
-                (expected.len() > 1).then_some(expected.len())
-            );
-            if report.truncated {
-                let text = tolmap::query::text(&report);
-                assert!(text.contains(&format!("{} rows omitted", report.omitted)));
-                assert!(text.contains(&format!("--limit {}", report.next_limit.unwrap())));
+            for limit in [0, 1, 2, in_total.max(out_total)] {
+                let report = s.deps(path, direction, limit);
+                let incoming = (direction != Direction::Out).then_some(in_total);
+                let outgoing = (direction != Direction::In).then_some(out_total);
+                let counts = |total: usize| json!({"total": total, "returned": total.min(limit), "omitted": total.saturating_sub(limit)});
+                let wire = serde_json::to_value(&report).unwrap();
+                assert_eq!(
+                    wire["directions"],
+                    json!({"in": incoming.map(counts), "out": outgoing.map(counts)})
+                );
+                let total = incoming.unwrap_or(0) + outgoing.unwrap_or(0);
+                let full_limit = incoming.max(outgoing).unwrap();
+                let mut expected = Vec::new();
+                if incoming.is_some() {
+                    expected.extend(importers.iter().take(limit).map(|&p| (p, "in")));
+                }
+                if outgoing.is_some() {
+                    expected.extend(imports.iter().take(limit).map(|&p| (p, "out")));
+                }
+                expected.sort_unstable();
+                let actual: Vec<_> = wire["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["path"].as_str().unwrap(),
+                            row["direction"].as_str().unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(actual, expected);
+                assert_eq!(wire["total"], total);
+                assert_eq!(wire["returned"], expected.len());
+                assert_eq!(wire["omitted"], total - expected.len());
+                assert_eq!(wire["truncated"], full_limit > limit);
+                assert_eq!(
+                    wire["next_limit"],
+                    json!((full_limit > limit).then_some(full_limit))
+                );
             }
-            assert_eq!(report.results.len(), expected.len().min(1));
-            assert_eq!(
-                serde_json::to_vec(&report).unwrap(),
-                serde_json::to_vec(&s.deps(path, direction, 1)).unwrap()
-            );
         }
     }
-    let s = fixture("tolmap");
     let report = s.deps("src/main.rs", Direction::Both, 8);
     assert!(serde_json::to_vec(&report).unwrap().len() < 2000);
-    assert_eq!(s.deps("missing", Direction::Both, 8).total, 0);
+    let missing = s.deps("missing", Direction::Both, 0);
+    assert_eq!(missing.total, 0);
+    assert!(!missing.truncated);
+    assert_eq!(missing.next_limit, None);
+    assert_eq!(
+        serde_json::to_value(missing).unwrap()["directions"],
+        json!({
+            "in": {"total": 0, "returned": 0, "omitted": 0},
+            "out": {"total": 0, "returned": 0, "omitted": 0}
+        })
+    );
+}
+
+#[test]
+fn deps_cli_is_deterministic_and_reports_directional_truncation() {
+    let map = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/tolmap.json");
+    let run = |direction: &str, limit: &str, format: &str| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tolmap"))
+            .args([
+                "deps",
+                "src/progress.rs",
+                "--direction",
+                direction,
+                "--limit",
+                limit,
+                "--format",
+                format,
+                "--map",
+            ])
+            .arg(&map)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        output.stdout
+    };
+    assert_eq!(run("both", "2", "json"), run("both", "2", "json"));
+    let text = String::from_utf8(run("both", "1", "text")).unwrap();
+    assert!(text.contains("in (importers): 1 of 14 results\n"));
+    assert!(text.contains("out (imports): 1 of 2 results\n"));
+    assert!(text.contains("in (importers): 13 rows omitted; repeat with --limit 14"));
+    assert!(text.contains("out (imports): 1 rows omitted; repeat with --limit 2"));
+    assert!(text.contains("\nin src/blobs.rs ["));
+    assert!(text.contains("\nout src/extract.rs ["));
+    let text = String::from_utf8(run("both", "2", "text")).unwrap();
+    assert!(text.contains("out (imports): 2 of 2 results\n"));
+    assert!(!text
+        .lines()
+        .any(|line| line.starts_with("out (imports):") && line.contains("omitted")));
+    let text = String::from_utf8(run("out", "0", "text")).unwrap();
+    assert!(!text.contains("in (importers):"));
+    assert!(text.contains("out (imports): 0 of 2 results\n"));
+    assert!(text.contains("out (imports): 2 rows omitted; repeat with --limit 2"));
+    assert!(!text.contains("\nout src/"));
 }
 
 #[test]
@@ -193,7 +269,11 @@ fn cli_exit_codes_and_text() {
             .unwrap();
         assert_eq!(output.status.code(), Some(0));
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(report["schema"], QUERY_SCHEMA);
+        assert_eq!(report["schema"], "tolmap.query/v3");
+        assert_eq!(
+            report.get("directions").is_some(),
+            report["query"]["kind"] == "deps"
+        );
         if report["query"]["kind"] == "overview" {
             assert_eq!(
                 report["results"].as_array().unwrap().len(),
