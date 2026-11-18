@@ -2333,6 +2333,7 @@ pub(crate) fn resolve(
         uses,
         module_for,
         rust_mod: Some(crate::schema::RustModTree {
+            subtree_fanin: BTreeMap::new(),
             roots: rust_mod.roots.into_iter().map(|root| ids[&root]).collect(),
             pairs: rust_mod
                 .declared
@@ -2362,6 +2363,42 @@ mod tests {
         let progress = crate::progress::Progress::silent();
         let stage = progress.stage(crate::progress::StageId::Resolve, Some(parsed.len() as u64));
         resolve(root, ".", parsed, raw, &stage).unwrap()
+    }
+
+    #[test]
+    fn subtree_fanin_uses_resolved_child_and_grandchild_import_mass() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"subtree\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(root, "src/lib.rs", "pub mod parent;\npub mod outside;\n");
+        write(root, "src/parent.rs", "mod child;\npub struct Item;\n");
+        write(
+            root,
+            "src/parent/child.rs",
+            "mod grandchild;\nuse super::Item;\n",
+        );
+        write(
+            root,
+            "src/parent/child/grandchild.rs",
+            "use super::super::Item;\n",
+        );
+        write(root, "src/outside.rs", "use crate::parent::Item;\n");
+        let source = intermediate(root);
+        let parent = source
+            .files
+            .iter()
+            .position(|path| path == "src/parent.rs")
+            .unwrap() as FileId;
+        let before = source.directed.clone();
+        let mut tree = source.rust_mod.unwrap();
+        tree.measure_subtree_fanin(&source.directed);
+        assert_eq!(source.fanin[&parent], 3.0);
+        assert_eq!(tree.subtree_fanin[&parent], 2.0);
+        assert_eq!(source.directed, before);
     }
 
     fn edges(root: &Path) -> BTreeMap<(String, String), f64> {

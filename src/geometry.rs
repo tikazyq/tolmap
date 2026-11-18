@@ -860,6 +860,21 @@ fn compact(
         build_entries,
         generated,
         package_roots,
+        rust_subtree_fanin_measured: layout.weighted.rust_mod.is_some(),
+        rust_subtree_fanin: layout
+            .weighted
+            .rust_mod
+            .as_ref()
+            .map(|tree| {
+                tree.subtree_fanin
+                    .iter()
+                    .filter_map(|(&file, &mass)| {
+                        let mass = round_to(mass, 2);
+                        (mass > 0.0).then_some((file, mass))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .filter(|mass| !mass.is_empty()),
     });
     let mut groups = BTreeMap::<usize, Vec<usize>>::new();
     for (index, &district) in layout.membership.iter().enumerate() {

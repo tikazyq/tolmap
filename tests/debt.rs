@@ -328,7 +328,7 @@ fn debt_cli_formats_and_exit_codes() {
     let (code, json) = run(&["--map", m, "--format", "json"]);
     assert_eq!(code, 0);
     let compact: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(compact["version"], 8);
+    assert_eq!(compact["version"], debt::DEBT_REPORT_VERSION);
     assert!(compact.get("pinned").is_none());
     assert_eq!(compact["cycle_evidence"], "compact");
     assert_eq!(compact["cycles"][0]["cross_edges"], 3);
@@ -626,6 +626,129 @@ fn pinned_report_keeps_base_districts_and_only_the_change_differs() {
 }
 
 #[test]
+fn pinned_cutoffs_do_not_promote_untouched_files_when_a_low_score_file_is_added() {
+    let mut base = synthetic();
+    base.files.clear();
+    base.nodes.clear();
+    base.edges.clear();
+    base.landmarks.clear();
+    for file in 0..40 {
+        base.files.push(format!("src/file_{file:02}.rs"));
+        let mut node = synthetic().nodes[1].clone();
+        node.0 .0 = 0;
+        node.0 .4 = 100 - file;
+        node.0 .5 = 1;
+        node.0 .6 = (100 - file) as f64;
+        base.nodes.push(node);
+    }
+    let base_report = debt::findings(&base);
+    assert_eq!(base_report.god_files.len(), 2);
+    assert_eq!(base_report.hotspots.len(), 2);
+    let mut head = base.clone();
+    head.files.push("src/new.rs".to_owned());
+    let mut low = base.nodes[39].clone();
+    low.0 .4 = 1;
+    low.0 .6 = 1.0;
+    head.nodes.push(low);
+    let unpinned = debt::findings(&head);
+    assert_eq!(unpinned.god_files.len(), 3);
+    assert_eq!(unpinned.hotspots.len(), 3);
+    let (_, report) = pinned(&head, &base, "base-sha");
+    assert_eq!(report.god_files, base_report.god_files);
+    assert_eq!(report.hotspots, base_report.hotspots);
+    assert_eq!(report.thresholds.god_min_fanin, Some(99.0));
+    assert_eq!(report.thresholds.god_min_complexity, Some(99));
+    assert_eq!(report.thresholds.hotspot_min_score, Some(99));
+    assert!(report.pinned.as_ref().unwrap().thresholds_from_base);
+
+    // Base cuts are fixed, but ranks still compare against the head.
+    head.nodes[40].0 .4 = 101;
+    head.nodes[40].0 .6 = 101.0;
+    let (_, report) = pinned(&head, &base, "base-sha");
+    assert_eq!(report.god_files[1].fanin_rank, 2);
+    assert_eq!(report.god_files[1].complexity_rank, 2);
+    assert_eq!(report.hotspots[1].rank, 2);
+    assert_eq!(report.thresholds, base_report.thresholds);
+}
+
+#[test]
+fn god_files_use_adjusted_fanin_and_keep_raw_evidence() {
+    let mut document = synthetic();
+    // Raw top fan-in belongs to god.py (9). Removing descendant mass
+    // leaves core.py and util.py (2) as the top adjusted fan-in files.
+    let mut value = serde_json::to_value(&document).unwrap();
+    value["D"] = serde_json::json!({
+        "rust_subtree_fanin_measured": true,
+        "rust_subtree_fanin": {"11": 8.0}
+    });
+    document = serde_json::from_value(value).unwrap();
+    let report = debt::findings(&document);
+    assert!(report.rust_subtree_fanin_measured);
+    assert_eq!(report.thresholds.god_min_fanin, Some(2.0));
+    assert!(report.god_files.is_empty());
+
+    // Pinned adjusted base cuts also apply when the head changes metrics.
+    document.nodes[1].0 .4 = 60;
+    document.nodes[1].0 .6 = 3.0;
+    let mut head = document.clone();
+    head.debt
+        .as_mut()
+        .unwrap()
+        .rust_subtree_fanin
+        .as_mut()
+        .unwrap()
+        .insert(1, 0.5);
+    let (_, report) = pinned(&head, &document, "base-sha");
+    assert_eq!(report.thresholds.god_min_fanin, Some(3.0));
+    assert!(report.god_files.is_empty());
+    assert!(report.pinned.unwrap().rust_subtree_fanin_measured);
+
+    let report = debt::findings(&head);
+    let god = &report.god_files[0];
+    assert_eq!((god.fanin, god.raw_fanin, god.fanin_rank), (2.5, 3.0, 1));
+    assert!(debt::render_text(&report).contains("fan-in 2.5 (raw 3)"));
+    assert!(debt::to_lens(&report, &head)
+        .notes
+        .iter()
+        .any(|note| note.text.contains("fan-in 2.5 (raw 3; rank 1)")));
+
+    let old = debt::findings(&synthetic());
+    assert!(!old.rust_subtree_fanin_measured);
+    assert_eq!(old.god_files[0].fanin, old.god_files[0].raw_fanin);
+    assert!(debt::render_text(&old).contains("subtree fan-in adjustment not measured"));
+}
+
+#[test]
+fn measured_zero_subtree_mass_is_distinct_from_old_maps_and_omitted() {
+    let mut value = serde_json::to_value(synthetic()).unwrap();
+    value["D"] = serde_json::json!({"rust_subtree_fanin_measured": true});
+    let document: MapDocument = serde_json::from_value(value).unwrap();
+    let report = debt::findings(&document);
+    assert!(report.rust_subtree_fanin_measured);
+    assert_eq!(report.god_files, debt::findings(&synthetic()).god_files);
+    let serialized = serde_json::to_value(&document).unwrap();
+    assert!(serialized["D"].get("rust_subtree_fanin").is_none());
+}
+
+#[test]
+fn pinned_empty_base_cutoffs_stay_empty() {
+    let mut base = synthetic();
+    for node in &mut base.nodes {
+        node.0 .4 = 0;
+        node.0 .5 = 0;
+        node.0 .6 = 0.0;
+    }
+    let head = synthetic();
+    assert!(!debt::findings(&head).hotspots.is_empty());
+    let (_, report) = pinned(&head, &base, "base-sha");
+    assert_eq!(report.thresholds.god_min_fanin, None);
+    assert_eq!(report.thresholds.god_min_complexity, None);
+    assert_eq!(report.thresholds.hotspot_min_score, None);
+    assert!(report.god_files.is_empty());
+    assert!(report.hotspots.is_empty());
+}
+
+#[test]
 fn pinned_report_to_the_same_map_is_the_unpinned_report() {
     let base = synthetic();
     let (_, report) = pinned(&base, &base, "sha");
@@ -679,7 +802,7 @@ fn debt_cli_partition_from_and_diff_refusals() {
         )
     };
     let (pinned_head, value) = report("pinned-head.json", &head, Some(base.as_path()));
-    assert_eq!(value["version"], 8);
+    assert_eq!(value["version"], debt::DEBT_REPORT_VERSION);
     assert_eq!(value["pinned"]["map_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(value["pinned"]["placed_new_files"], 1);
     assert_eq!(value["pinned"]["unplaced_new_files"], 1);

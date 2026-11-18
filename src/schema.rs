@@ -407,6 +407,12 @@ pub struct DebtSidecar {
     pub generated: Option<Vec<GeneratedFile>>,
     #[serde(default)]
     pub package_roots: Option<Vec<PackageRoot>>,
+    // Whether weighted fan-in from Rust module descendants was measured.
+    #[serde(default)]
+    pub rust_subtree_fanin_measured: bool,
+    // Excluded mass by file index; absent when the measured mass is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_subtree_fanin: Option<BTreeMap<FileId, f64>>,
 }
 
 /// A package manifest root, relative to the repository. The root directory
@@ -676,6 +682,34 @@ pub type FileId = u32;
 pub struct RustModTree {
     pub roots: BTreeSet<FileId>,
     pub pairs: BTreeSet<(FileId, FileId)>,
+    pub subtree_fanin: BTreeMap<FileId, f64>,
+}
+
+impl RustModTree {
+    // Use the resolved declaration graph, including #[path] and include!,
+    // rather than guessing ancestry from directories. Visit each ancestor once
+    // even if conditional declarations give a child more than one parent.
+    pub(crate) fn measure_subtree_fanin(&mut self, directed: &BTreeMap<(FileId, FileId), f64>) {
+        let mut parents = BTreeMap::<FileId, Vec<FileId>>::new();
+        for &(parent, child) in &self.pairs {
+            parents.entry(child).or_default().push(parent);
+        }
+        self.subtree_fanin.clear();
+        for (&(source, target), &mass) in directed {
+            let mut pending = parents.get(&source).cloned().unwrap_or_default();
+            let mut seen = BTreeSet::from([source]);
+            while let Some(ancestor) = pending.pop() {
+                if !seen.insert(ancestor) {
+                    continue;
+                }
+                if ancestor == target {
+                    *self.subtree_fanin.entry(target).or_default() += mass;
+                    break;
+                }
+                pending.extend(parents.get(&ancestor).into_iter().flatten().copied());
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -926,6 +960,30 @@ pub struct WeightedGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtree_fanin_counts_transitive_descendants_once_and_preserves_imports() {
+        let mut tree = RustModTree {
+            roots: BTreeSet::from([0]),
+            // A diamond and a cycle exercise conditional declarations/includes.
+            pairs: BTreeSet::from([(0, 1), (0, 2), (1, 3), (2, 3), (3, 1)]),
+            subtree_fanin: BTreeMap::new(),
+        };
+        let directed = BTreeMap::from([
+            ((1, 0), 0.5),
+            ((3, 0), 0.25),
+            ((3, 1), 0.75),
+            ((4, 0), 2.0), // An external importer still counts.
+            ((2, 1), 1.0), // A sibling still counts.
+            ((0, 0), 1.0), // Self mass is not descendant mass.
+        ]);
+        let before = directed.clone();
+        tree.measure_subtree_fanin(&directed);
+        assert_eq!(tree.subtree_fanin, BTreeMap::from([(0, 0.75), (1, 0.75)]));
+        assert_eq!(directed, before);
+        tree.measure_subtree_fanin(&directed);
+        assert_eq!(tree.subtree_fanin, BTreeMap::from([(0, 0.75), (1, 0.75)]));
+    }
 
     #[test]
     fn old_map_with_terrain_deserializes_and_drops_removed_field() {

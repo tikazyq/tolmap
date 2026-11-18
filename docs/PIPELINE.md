@@ -9,6 +9,10 @@ Go imports name a *package*, so one import spreads 1/|D| weight across that dire
 
 The Rust product also reads Rust (`src/extract/rust.rs`, finding 57), which the reference never did. A crate's module tree is built from `Cargo.toml` and `mod` declarations, and each `use` or written-out path links the file that defines the name it uses. Each `use` declaration shares a mass of 1 among the files it reaches.
 
+Debt report version 9 excludes weighted fan-in from a Rust module's own transitive declaration subtree when finding god files. Extraction measures this after reference selection and before import-weight rounding; `D.rust_subtree_fanin` retains excluded mass by file index, rounded to two decimal places and omitted when empty. `D.rust_subtree_fanin_measured` distinguishes a measured zero from an older map. Node fan-in, edges and all map-building inputs stay unchanged. Reports show adjusted `fanin` beside `raw_fanin`; the god-file cutoff and `fanin_rank` use the adjusted value. Older maps keep raw fan-in and report the adjustment as unmeasured.
+
+With `tolmap debt --partition-from <base>`, both the partition and the god-file fan-in, god-file complexity and production-hotspot score cutoffs come from the base map. `thresholds` contains those base cuts, including null cuts, and `pinned` identifies their source and whether the base fan-in adjustment was measured. File ranks still compare values within the head. Ordinary reports calculate their cuts from their own map.
+
 ## 2 · weight
 ```
 w(a,b) = α·static + β·cochange + γ·proximity + δ·semantic     α .45 β .35 γ .08 δ .12

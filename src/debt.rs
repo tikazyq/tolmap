@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use ts_rs::TS;
 
-pub const DEBT_REPORT_VERSION: u32 = 8;
+pub const DEBT_REPORT_VERSION: u32 = 9;
 
 // ---- thresholds ------------------------------------------------------------
 
@@ -228,6 +228,7 @@ pub struct GodFile {
     pub path: String,
     pub district: usize,
     pub fanin: f64,
+    pub raw_fanin: f64,
     pub fanin_rank: usize,
     pub complexity: usize,
     pub complexity_rank: usize,
@@ -297,6 +298,10 @@ pub enum CycleEvidence {
 pub struct PinnedBase {
     pub map_sha256: String,
     pub commit: Option<String>,
+    // All three percentile cutoffs in `thresholds` come from this base map.
+    pub thresholds_from_base: bool,
+    // Whether the base cutoff used measured Rust subtree-adjusted fan-in.
+    pub rust_subtree_fanin_measured: bool,
     // Files absent from the base that took a base district by edge weight.
     pub placed_new_files: usize,
     // Files absent from the base with no edge to a placed file.
@@ -334,6 +339,8 @@ pub struct DebtReport {
     pub cycles: Vec<DistrictCycle>,
     pub misplaced: Vec<MisplacedFile>,
     pub god_files: Vec<GodFile>,
+    // False for older maps without weighted Rust subtree evidence.
+    pub rust_subtree_fanin_measured: bool,
     pub hotspots: Vec<Hotspot>,
     /// Test files use the same path rule as no-inbound entry files and are
     /// excluded from production hotspot ranking.
@@ -780,13 +787,61 @@ fn cycles(map: &MapDocument, unplaced: Option<usize>) -> Vec<DistrictCycle> {
     cycles
 }
 
+fn adjusted_fanin(map: &MapDocument) -> Vec<f64> {
+    let measured = map
+        .debt
+        .as_ref()
+        .filter(|debt| debt.rust_subtree_fanin_measured);
+    map.nodes
+        .iter()
+        .enumerate()
+        .map(|(file, node)| {
+            let excluded = measured
+                .and_then(|debt| debt.rust_subtree_fanin.as_ref())
+                .and_then(|mass| mass.get(&(file as u32)))
+                .copied()
+                .unwrap_or(0.0);
+            if excluded == 0.0 {
+                node.fanin()
+            } else {
+                round4((node.fanin() - excluded).max(0.0))
+            }
+        })
+        .collect()
+}
+
+fn percentile_cuts(map: &MapDocument) -> (Option<f64>, Option<usize>, Option<usize>) {
+    let fanin = adjusted_fanin(map);
+    let complexity = map
+        .nodes
+        .iter()
+        .map(|node| node.complexity())
+        .collect::<Vec<_>>();
+    let scores = map
+        .files
+        .iter()
+        .zip(&map.nodes)
+        .filter(|(path, _)| !is_test_path(path) && !is_non_production_path(path))
+        .map(|(_, node)| node.churn() * node.complexity())
+        .collect::<Vec<_>>();
+    (
+        top_cut(&fanin, GOD_TOP_FRACTION, 1),
+        top_cut(&complexity, GOD_TOP_FRACTION, 1),
+        top_cut(&scores, HOTSPOT_TOP_FRACTION, HOTSPOT_MIN_COUNT),
+    )
+}
+
 pub fn findings(map: &MapDocument) -> DebtReport {
-    findings_with_unplaced(map, None)
+    findings_with_unplaced(map, None, map)
 }
 
 // `unplaced` is the district id that stands for files with no base district:
 // they take part in file-level findings but in no district cycle or tally.
-fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtReport {
+fn findings_with_unplaced(
+    map: &MapDocument,
+    unplaced: Option<usize>,
+    threshold_map: &MapDocument,
+) -> DebtReport {
     let n = map.files.len();
     let district = |f: usize| map.nodes[f].district();
     let file_edges = map
@@ -916,10 +971,13 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
         .count();
     misplaced.retain(|file| !generated_paths.contains(file.path.as_str()));
 
-    let fanin: Vec<f64> = map.nodes.iter().map(|r| r.fanin()).collect();
+    let fanin = adjusted_fanin(map);
+    let rust_subtree_fanin_measured = map
+        .debt
+        .as_ref()
+        .is_some_and(|debt| debt.rust_subtree_fanin_measured);
     let complexity: Vec<usize> = map.nodes.iter().map(|r| r.complexity()).collect();
-    let god_min_fanin = top_cut(&fanin, GOD_TOP_FRACTION, 1);
-    let god_min_complexity = top_cut(&complexity, GOD_TOP_FRACTION, 1);
+    let (god_min_fanin, god_min_complexity, hotspot_min_score) = percentile_cuts(threshold_map);
     let mut god_files: Vec<GodFile> = match (god_min_fanin, god_min_complexity) {
         (Some(cf), Some(cc)) => (0..n)
             .filter(|&f| fanin[f] >= cf && complexity[f] >= cc)
@@ -927,6 +985,7 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
                 path: map.files[f].clone(),
                 district: district(f),
                 fanin: fanin[f],
+                raw_fanin: map.nodes[f].fanin(),
                 fanin_rank: rank(&fanin, &fanin[f]),
                 complexity: complexity[f],
                 complexity_rank: rank(&complexity, &complexity[f]),
@@ -955,11 +1014,6 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
         .count();
     let production =
         |f: usize| !is_test_path(&map.files[f]) && !is_non_production_path(&map.files[f]);
-    let production_scores = (0..n)
-        .filter(|&f| production(f))
-        .map(|f| score[f])
-        .collect::<Vec<_>>();
-    let hotspot_min_score = top_cut(&production_scores, HOTSPOT_TOP_FRACTION, HOTSPOT_MIN_COUNT);
     let mut hot: Vec<usize> = match hotspot_min_score {
         Some(cut) => (0..n)
             .filter(|&f| production(f) && score[f] >= cut)
@@ -1176,6 +1230,7 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
         cycles: cycles(map, unplaced),
         misplaced,
         god_files,
+        rust_subtree_fanin_measured,
         hotspots,
         test_hotspot_files_excluded,
         non_production_hotspot_files_excluded,
@@ -1459,14 +1514,20 @@ pub fn to_lens(report: &DebtReport, map: &MapDocument) -> Lens {
         note(
             &g.path,
             format!(
-                "god file: fan-in {} (rank {}), complexity {} (rank {}); both in the top {} (fan-in ≥ {}, complexity ≥ {})",
+                "god file: fan-in {} (raw {}; rank {}), complexity {} (rank {}); both in the top {} (fan-in ≥ {}, complexity ≥ {}); {}",
                 g.fanin,
+                g.raw_fanin,
                 g.fanin_rank,
                 g.complexity,
                 g.complexity_rank,
                 pct(t.god_top_fraction),
                 t.god_min_fanin.unwrap_or_default(),
-                t.god_min_complexity.unwrap_or_default()
+                t.god_min_complexity.unwrap_or_default(),
+                if report.rust_subtree_fanin_measured {
+                    "Rust module subtree fan-in excluded"
+                } else {
+                    "Rust module subtree fan-in adjustment not measured"
+                }
             ),
         );
         add(&mut kinds, KIND_GOD, [g.path.as_str()]);
@@ -1615,6 +1676,14 @@ fn render_text_with_files(report: &DebtReport, files: Option<&[String]>) -> Stri
             pin.placed_new_files,
             pin.unplaced_new_files
         );
+        let _ = writeln!(
+            out,
+            "base percentile cutoffs: fan-in >= {:?}, complexity >= {:?}, hotspot score >= {:?}; base Rust subtree fan-in adjustment {}",
+            t.god_min_fanin,
+            t.god_min_complexity,
+            t.hotspot_min_score,
+            if pin.rust_subtree_fanin_measured { "measured" } else { "not measured" }
+        );
     }
     if report.cycle_evidence == CycleEvidence::Compact {
         out.push_str("cycle evidence: compact (use --cycle-evidence full for bundles)\n");
@@ -1650,6 +1719,11 @@ fn render_text_with_files(report: &DebtReport, files: Option<&[String]>) -> Stri
         report.unreached_generated_files_excluded,
         report.isolated_files,
     );
+    if report.rust_subtree_fanin_measured {
+        out.push_str("god-file fan-in excludes measured Rust module subtree mass\n");
+    } else {
+        out.push_str("Rust module subtree fan-in adjustment not measured (using raw fan-in)\n");
+    }
     if !report.generated_file_measurement {
         out.push_str("generated-file handling not measured (map has no generated-file sidecar)\n");
     }
@@ -1757,8 +1831,8 @@ fn render_text_with_files(report: &DebtReport, files: Option<&[String]>) -> Stri
     for g in &report.god_files {
         let _ = writeln!(
             out,
-            "god {}: fan-in {}, complexity {}",
-            g.path, g.fanin, g.complexity
+            "god {}: fan-in {} (raw {}), complexity {}",
+            g.path, g.fanin, g.raw_fanin, g.complexity
         );
     }
     for h in &report.hotspots {
@@ -2028,10 +2102,16 @@ pub fn findings_pinned(
     base_commit: Option<String>,
 ) -> (MapDocument, DebtReport) {
     let (relabeled, placed, unplaced, left) = relabel_to_base(head, base);
-    let mut report = findings_with_unplaced(&relabeled, (!left.is_empty()).then_some(unplaced));
+    let mut report =
+        findings_with_unplaced(&relabeled, (!left.is_empty()).then_some(unplaced), base);
     report.pinned = Some(PinnedBase {
         map_sha256: base_sha256,
         commit: base_commit,
+        thresholds_from_base: true,
+        rust_subtree_fanin_measured: base
+            .debt
+            .as_ref()
+            .is_some_and(|debt| debt.rust_subtree_fanin_measured),
         placed_new_files: placed,
         unplaced_new_files: left.len(),
         unplaced_paths: left,

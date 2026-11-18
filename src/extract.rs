@@ -1686,6 +1686,7 @@ fn union_sources(mut intermediates: Vec<SourceIntermediate>) -> Result<MergedSou
         uses,
         module_for,
         rust_mod: rust_mod_measured.then_some(RustModTree {
+            subtree_fanin: BTreeMap::new(),
             roots: rust_mod_roots,
             pairs: rust_mod_pairs,
         }),
@@ -6651,11 +6652,16 @@ fn finish_graph(
         dominant_lang,
         build_output_mirror,
         python_cross_project,
-        rust_mod,
+        mut rust_mod,
         generated,
         build_entries,
         package_roots,
     } = merged;
+    // Measure before import weights are rounded, after any SCIP replacement.
+    // This evidence never changes node fan-in or any graph-building input.
+    if let Some(tree) = &mut rust_mod {
+        tree.measure_subtree_fanin(&directed);
+    }
 
     let history_stage = progress.stage(crate::progress::StageId::History, None);
     let history = git_history(
