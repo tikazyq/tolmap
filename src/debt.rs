@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use ts_rs::TS;
 
-pub const DEBT_REPORT_VERSION: u32 = 7;
+pub const DEBT_REPORT_VERSION: u32 = 8;
+const UNPLACED_NAME: &str = "(unplaced)";
 
 // ---- thresholds ------------------------------------------------------------
 
@@ -275,7 +276,7 @@ pub struct HiddenCoupling {
     pub weight: f64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct DebtFilters {
     pub kinds: Vec<String>,
@@ -293,10 +294,22 @@ pub enum CycleEvidence {
 
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct DebtPartition {
+    pub base_map_sha256: String,
+    pub base_commit: Option<String>,
+    pub placed_new_files: usize,
+    pub unplaced_new_files: usize,
+    pub unplaced_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct DebtReport {
     pub version: u32,
     pub cycle_evidence: CycleEvidence,
     pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<DebtPartition>,
     /// Counts before the selected CLI filters are applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unfiltered_counts: Option<BTreeMap<String, usize>>,
@@ -608,7 +621,7 @@ fn has_cycle(graph: &BTreeMap<String, BTreeSet<String>>) -> bool {
         .any(|node| !visited.contains(node) && visit(node, graph, &mut visiting, &mut visited))
 }
 
-fn cycles(map: &MapDocument) -> Vec<DistrictCycle> {
+fn cycles(map: &MapDocument, unplaced: Option<usize>) -> Vec<DistrictCycle> {
     let package_roots = map.debt.as_ref().and_then(|debt| {
         debt.package_roots.as_ref().map(|roots| {
             roots
@@ -631,12 +644,21 @@ fn cycles(map: &MapDocument) -> Vec<DistrictCycle> {
     let mut bundles = BTreeMap::<(usize, usize), Vec<DebtEdge>>::new();
     let mut graph: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     for &[a, b] in &map.edges {
+        // Ignore unplaced endpoints even when a generated binding would
+        // otherwise be attributed to a generator in a base district.
+        if [a, b].into_iter().any(|f| Some(district(f)) == unplaced) {
+            continue;
+        }
         let (from, to) = (collapsed[a], collapsed[b]);
         if from == to {
             continue;
         }
         let (from_district, to_district) = (district(from), district(to));
-        if from_district == to_district {
+        if from_district == to_district
+            || [from_district, to_district]
+                .into_iter()
+                .any(|d| Some(d) == unplaced)
+        {
             continue;
         }
         graph.entry(from_district).or_default().insert(to_district);
@@ -761,6 +783,10 @@ fn cycles(map: &MapDocument) -> Vec<DistrictCycle> {
 }
 
 pub fn findings(map: &MapDocument) -> DebtReport {
+    findings_with_unplaced(map, None)
+}
+
+fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtReport {
     let n = map.files.len();
     let district = |f: usize| map.nodes[f].district();
     let file_edges = map
@@ -1108,6 +1134,7 @@ pub fn findings(map: &MapDocument) -> DebtReport {
         version: DEBT_REPORT_VERSION,
         cycle_evidence: CycleEvidence::Full,
         repo: map.repo.clone(),
+        partition: None,
         unfiltered_counts: None,
         filters: None,
         filtered_counts: None,
@@ -1139,7 +1166,7 @@ pub fn findings(map: &MapDocument) -> DebtReport {
             entry_stem_suffixes: strings(ENTRY_STEM_SUFFIXES),
         },
         coverage: map.coverage.clone(),
-        cycles: cycles(map),
+        cycles: cycles(map, unplaced),
         misplaced,
         god_files,
         hotspots,
@@ -1547,6 +1574,18 @@ pub fn render_json(report: &DebtReport) -> String {
     text
 }
 
+fn partition_text(partition: &DebtPartition) -> String {
+    let commit = partition.base_commit.as_deref().unwrap_or("unknown");
+    format!(
+        "partition pinned to base map sha256 {} (commit {}): {} new files placed, {} new files in {UNPLACED_NAME}: {:?}",
+        partition.base_map_sha256,
+        commit.escape_debug(),
+        partition.placed_new_files,
+        partition.unplaced_new_files,
+        partition.unplaced_paths,
+    )
+}
+
 pub fn render_text(report: &DebtReport) -> String {
     render_text_with_files(report, None)
 }
@@ -1572,6 +1611,9 @@ fn render_text_with_files(report: &DebtReport, files: Option<&[String]>) -> Stri
         "debt findings for {} ({} files, {} edges); counts are lower bounds",
         report.repo, report.files, report.edges
     );
+    if let Some(partition) = &report.partition {
+        let _ = writeln!(out, "{}", partition_text(partition));
+    }
     if report.cycle_evidence == CycleEvidence::Compact {
         out.push_str("cycle evidence: compact (use --cycle-evidence full for bundles)\n");
     }
@@ -1901,21 +1943,96 @@ fn apply_filters(
     }
 }
 
+fn pin_partition(
+    head: &mut MapDocument,
+    base: crate::query::Snapshot,
+) -> (DebtPartition, Option<usize>) {
+    let base_membership = base
+        .map
+        .files
+        .iter()
+        .zip(&base.map.nodes)
+        .map(|(path, node)| (path, node.district()))
+        .collect::<BTreeMap<_, _>>();
+    let inherited = head
+        .files
+        .iter()
+        .map(|path| base_membership.get(path).copied())
+        .collect::<Vec<_>>();
+
+    // A stored map retains directed import edges, but no blend weights.
+    // Apply check's placement rule with unit weight per retained edge, using
+    // only inherited targets so assignments cannot depend on file order.
+    let mut weights = BTreeMap::<usize, BTreeMap<usize, f64>>::new();
+    for &[from, to] in &head.edges {
+        if let (None, Some(district)) = (inherited[from], inherited[to]) {
+            *weights
+                .entry(from)
+                .or_default()
+                .entry(district)
+                .or_default() += 1.0;
+        }
+    }
+
+    // The report reads membership and names from this in-memory map. It
+    // does not use its district geometry or roads.
+    head.names = base.map.names;
+    let mut unplaced = None;
+    let mut partition = DebtPartition {
+        base_map_sha256: base.identity.sha256,
+        base_commit: base.identity.commit,
+        placed_new_files: 0,
+        unplaced_new_files: 0,
+        unplaced_paths: Vec::new(),
+    };
+    for (file, (node, inherited)) in head.nodes.iter_mut().zip(inherited).enumerate() {
+        node.0 .0 = if let Some(district) = inherited {
+            district
+        } else if let Some(district) = weights.get(&file).and_then(crate::check::place) {
+            partition.placed_new_files += 1;
+            district
+        } else {
+            partition.unplaced_paths.push(head.files[file].clone());
+            *unplaced.get_or_insert_with(|| {
+                let id = (0..)
+                    .find(|id: &usize| !head.names.contains_key(&id.to_string()))
+                    .expect("there is an unused district id");
+                head.names.insert(id.to_string(), UNPLACED_NAME.to_owned());
+                id
+            })
+        };
+    }
+    partition.unplaced_paths.sort();
+    partition.unplaced_new_files = partition.unplaced_paths.len();
+    (partition, unplaced)
+}
+
 // `tolmap debt`. Findings are informational: 0 on success, 2 on an
 // unreadable map.
 pub fn run(map: &std::path::Path, format: &str) -> i32 {
-    run_filtered(map, format, &[], None, None, None, CycleEvidence::Compact)
+    run_filtered(
+        map,
+        None,
+        format,
+        &DebtFilters::default(),
+        CycleEvidence::Compact,
+    )
 }
 
 pub fn run_filtered(
     map: &std::path::Path,
+    partition_from: Option<&std::path::Path>,
     format: &str,
-    kinds: &[String],
-    path: Option<&str>,
-    district: Option<&str>,
-    top: Option<usize>,
+    filters: &DebtFilters,
     cycle_evidence: CycleEvidence,
 ) -> i32 {
+    let DebtFilters {
+        kinds,
+        path,
+        district,
+        top,
+    } = filters;
+    let (path, district, top) = (path.as_deref(), district.as_deref(), *top);
     let bytes = match std::fs::read(map) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1923,14 +2040,31 @@ pub fn run_filtered(
             return 2;
         }
     };
-    let doc: MapDocument = match serde_json::from_slice(&bytes) {
+    let mut doc: MapDocument = match serde_json::from_slice(&bytes) {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("tolmap debt: {}: not a map document: {e}", map.display());
             return 2;
         }
     };
-    let mut report = findings(&doc);
+    let mut report = if let Some(base_path) = partition_from {
+        let base = match crate::query::Snapshot::load(base_path) {
+            Ok(base) => base,
+            Err(error) => {
+                eprintln!(
+                    "tolmap debt: --partition-from {}: {error:#}",
+                    base_path.display()
+                );
+                return 2;
+            }
+        };
+        let (partition, unplaced) = pin_partition(&mut doc, base);
+        let mut report = findings_with_unplaced(&doc, unplaced);
+        report.partition = Some(partition);
+        report
+    } else {
+        findings(&doc)
+    };
     apply_filters(&mut report, &doc, kinds, path, district, top);
     if format != "lens" && cycle_evidence == CycleEvidence::Compact {
         compact_cycles(&mut report);
@@ -1942,6 +2076,9 @@ pub fn run_filtered(
                 "# applied filters: kinds={:?}, path={:?}, district={:?}, top={:?}\n",
                 kinds, path, district, top
             );
+            if let Some(partition) = &report.partition {
+                text.push_str(&format!("# {}\n", partition_text(partition)));
+            }
             text.push_str(&to_lens(&report, &doc).to_toml());
             text
         }
@@ -2055,6 +2192,17 @@ pub fn run_diff(before_path: &std::path::Path, after_path: &std::path::Path) -> 
             "tolmap debt diff: filtered reports cannot be compared; provide unfiltered reports"
         );
         return 2;
+    }
+    match (&before.partition, &after.partition) {
+        (Some(a), Some(b)) if a.base_map_sha256 != b.base_map_sha256 => {
+            eprintln!("tolmap debt diff: reports are pinned to different base maps");
+            return 2;
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!("tolmap debt diff: cannot compare a pinned report with an unpinned report");
+            return 2;
+        }
+        _ => {}
     }
     let a = report_items(&before);
     let b = report_items(&after);

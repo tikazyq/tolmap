@@ -141,7 +141,7 @@ to suggest is not written, and a message on stderr says why (a map with no
 Exit 0, or 2 when the map cannot be read or a file cannot be written.
 `data/lenses/flask-suggest/` holds the suggestions for the pinned flask fixture.
 
-### `tolmap debt --map <map.json> [--format text|json|lens] [--kind <kind>...] [--path <prefix-or-glob>] [--district <name>] [--top <n>] [--cycle-evidence compact|full]`
+### `tolmap debt --map <map.json> [--partition-from <base-map.json>] [--format text|json|lens] [--kind <kind>...] [--path <prefix-or-glob>] [--district <name>] [--top <n>] [--cycle-evidence compact|full]`
 
 `--kind` is repeatable and accepts `cycle`, `misplaced`, `god`, `hotspot`,
 `unreached`, `undeclared-rust` or `hidden-coupling` (the CLI spellings of the
@@ -154,13 +154,27 @@ text, JSON and lens TOML;
 all outputs identify the selections (lens TOML uses a leading comment, which is
 valid TOML and ignored by `tolmap lens check`). Filtered JSON keeps the normal
 DebtReport version and lower-bound evidence, with additive `unfiltered_counts`,
-`filtered_counts` and `filters` fields. DebtReport is now v7: `cycle_evidence` is
-`compact` by default for CLI text/JSON. Compact cycles retain member districts,
+`filtered_counts` and `filters` fields. DebtReport is now v8. The default
+`cycle_evidence` for CLI text/JSON is `compact`. Compact cycles retain member districts,
 `cross_edges`, one `route` and its `closing_edges`, package names and measurement
 flags. Their `package_edges`, `mutual_pairs` and `cut` arrays are empty;
 `cycle_evidence` distinguishes omitted evidence from measured empty bundles.
 `--cycle-evidence full` restores those bundles. Lens output always uses full
 evidence because its areas and notes depend on bundles.
+
+Use `--partition-from <base-map.json>` on both sides of a refactor comparison.
+The head map can also be selected through `--repo`, `--commit` or `--snapshot`.
+Files matched by path keep their base district and its name. Base-only files
+are absent. As in `tolmap check`, a new file goes to the district with the
+most outgoing weight from that file to inherited members, with ties broken
+by the lowest district ID. Stored maps carry directed edges without weights,
+so each retained edge counts as one. A new file with no such edge is listed in
+`(unplaced)` and can only appear in file-level findings.
+
+Pinned reports include `partition` with `base_map_sha256` (of the original map
+bytes), `base_commit` (null if unknown), `placed_new_files`, `unplaced_new_files`
+and sorted `unplaced_paths`. Text and lens TOML also identify the pinned base.
+Ordinary reports omit `partition`.
 
 `tolmap debt diff <before-report.json> <after-report.json>` compares two unfiltered,
 versioned DebtReports. It emits version 2 JSON with each finding marked `added`,
@@ -170,10 +184,9 @@ or complexity on an unchanged finding remains shared. Reports must have the
 current DebtReport version. Cycles are compared using their compact summary,
 even when either input has full evidence; bundle-only changes are not reported.
 Cycle identity uses the closing route's file paths, so compact and full inputs
-for the same map compare equally. Filtered reports (including `--top`) are
-rejected. This subcommand is used instead of a map comparison
-because the requested input is a raw, reproducible comparison of two already
-computed reports.
+for the same map compare equally. The command exits 2 for filtered reports
+(including `--top`), a mix of pinned and unpinned reports, or pinned reports
+whose base map hashes differ.
 
 Structural debt findings (issue #250; `src/debt.rs`), computed offline from a
 stored map alone; the map is not changed and the same map gives byte-identical

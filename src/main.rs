@@ -300,6 +300,9 @@ enum Command {
         commit: Option<String>,
         #[arg(long, conflicts_with = "map")]
         snapshot: Option<String>,
+        /// Use district membership and names from this base map JSON.
+        #[arg(long)]
+        partition_from: Option<PathBuf>,
         #[arg(long, default_value = "text", value_parser = ["text", "json", "lens"])]
         format: String,
         /// Keep only these finding kinds (repeatable).
@@ -994,6 +997,7 @@ fn main() -> Result<()> {
             repo,
             commit,
             snapshot,
+            partition_from,
             format,
             kind,
             path,
@@ -1014,11 +1018,14 @@ fn main() -> Result<()> {
                 ) {
                     Ok(map) => tolmap::debt::run_filtered(
                         &map,
+                        partition_from.as_deref(),
                         &format,
-                        &kind,
-                        path.as_deref(),
-                        district.as_deref(),
-                        top,
+                        &tolmap::debt::DebtFilters {
+                            kinds: kind,
+                            path,
+                            district,
+                            top,
+                        },
                         cycle_evidence,
                     ),
                     Err(error) => {

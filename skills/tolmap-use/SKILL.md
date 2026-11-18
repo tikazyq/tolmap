@@ -111,7 +111,6 @@ tolmap debt --map "$MAP" --kind cycle --cycle-evidence full --format json
 tolmap debt --map "$MAP" --kind hidden-coupling --path src/ --format json
 tolmap debt --map "$MAP" --district 'CLI · checking' --format json
 # Use actual district names returned by overview; the name above is illustrative.
-tolmap debt diff before-debt.json after-debt.json
 ```
 
 `--kind` is repeatable; `--path` accepts a prefix or glob. `--top` limits ranked
@@ -119,6 +118,16 @@ hotspot/god findings and cycles. Cycles default to compact summaries; use
 `--cycle-evidence full` for package, mutual-pair and cut bundles. Keep totals, filter
 counts, measurement flags and lower-bound wording with the findings. Missing
 history or generated-file evidence is unmeasured, not evidence of no debt.
-Use unfiltered current-version reports for `debt diff`; it compares raw findings
-and metric deltas, not maps. Cycles compare compact summaries in both evidence
-modes, so bundle-only differences are omitted. Read the files before proposing a structural edit.
+For a refactor, pin both reports to the same base map so changes in district
+membership are kept out of the comparison. Use unfiltered current-version reports.
+
+```sh
+tolmap debt --map "$BASE_MAP" --partition-from "$BASE_MAP" --format json > before-debt.json
+tolmap debt --map "$HEAD_MAP" --partition-from "$BASE_MAP" --format json > after-debt.json
+tolmap debt diff before-debt.json after-debt.json
+```
+
+Read the `partition` field for new-file placement counts and unplaced paths.
+`debt diff` compares finding identities and metric deltas. Cycles compare compact
+summaries in both evidence modes, so bundle-only differences are omitted. Read the
+files before proposing a structural edit.

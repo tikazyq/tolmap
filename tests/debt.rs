@@ -328,7 +328,8 @@ fn debt_cli_formats_and_exit_codes() {
     let (code, json) = run(&["--map", m, "--format", "json"]);
     assert_eq!(code, 0);
     let compact: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(compact["version"], 7);
+    assert_eq!(compact["version"], 8);
+    assert!(compact.get("partition").is_none());
     assert_eq!(compact["cycle_evidence"], "compact");
     assert_eq!(compact["cycles"][0]["cross_edges"], 3);
     assert_eq!(
@@ -435,6 +436,186 @@ fn debt_cli_formats_and_exit_codes() {
         run(&["--map", dir.path().join("absent.json").to_str().unwrap()]).0,
         2
     );
+}
+
+fn run_debt(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_tolmap"))
+        .arg("debt")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn debt_json(args: &[&str]) -> serde_json::Value {
+    let output = run_debt(args);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn debt_diff_on_a_fixed_partition_preserves_untouched_findings() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let base_path = dir.path().join(format!("{commit}.json"));
+    let head_path = dir.path().join("head.json");
+    let base = synthetic();
+    let base_bytes = serde_json::to_vec(&base).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(&base_bytes));
+    std::fs::write(&base_path, &base_bytes).unwrap();
+    let mut head = base.clone();
+    head.nodes[12].0 .5 = 25; // only hot.py changed
+    head.nodes[12].0 .0 = 4; // the new partition has five districts
+    head.names.insert("4".into(), "split".into());
+    head.districts
+        .insert("4".into(), base.districts["2"].clone());
+    head.nodes[7].0 .0 = 0; // the untouched misplaced file changed district
+    head.names.insert("0".into(), "renamed a".into());
+    std::fs::write(&head_path, serde_json::to_vec(&head).unwrap()).unwrap();
+    let b = base_path.to_str().unwrap();
+    let h = head_path.to_str().unwrap();
+    let ordinary_base = debt_json(&["--map", b, "--format", "json", "--cycle-evidence", "full"]);
+    let ordinary_head = debt_json(&["--map", h, "--format", "json"]);
+    let pinned = |map: &str, partition: &str| {
+        debt_json(&[
+            "--map",
+            map,
+            "--partition-from",
+            partition,
+            "--format",
+            "json",
+            "--cycle-evidence",
+            "full",
+        ])
+    };
+    let pinned_base = pinned(b, b);
+    let pinned_head = pinned(h, b);
+    assert_eq!(pinned_head["partition"]["base_map_sha256"], sha256);
+    assert_eq!(pinned_head["partition"]["base_commit"], commit);
+    assert_eq!(pinned_head["partition"]["placed_new_files"], 0);
+    assert_eq!(pinned_head["partition"]["unplaced_new_files"], 0);
+    let mut self_pinned = pinned_base.clone();
+    self_pinned.as_object_mut().unwrap().remove("partition");
+    assert_eq!(self_pinned, ordinary_base);
+
+    let before = dir.path().join("before.json");
+    let after = dir.path().join("after.json");
+    let diff_args = ["diff", before.to_str().unwrap(), after.to_str().unwrap()];
+    let write_reports = |base: &serde_json::Value, head: &serde_json::Value| {
+        std::fs::write(&before, base.to_string()).unwrap();
+        std::fs::write(&after, head.to_string()).unwrap();
+    };
+    write_reports(&ordinary_base, &ordinary_head);
+    let diff = debt_json(&diff_args);
+    assert!(diff["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| { f["identity"] == "src/d/misplaced.py" && f["status"] == "removed" }));
+
+    write_reports(&pinned_base, &pinned_head);
+    let diff = debt_json(&diff_args);
+    let findings = diff["findings"].as_array().unwrap();
+    assert!(findings.iter().all(|f| f["status"] == "shared"));
+    assert!(findings
+        .iter()
+        .any(|f| f["identity"] == "src/d/misplaced.py"));
+    let changed = findings
+        .iter()
+        .filter(|f| f["before"] != f["after"])
+        .collect::<Vec<_>>();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0]["identity"], "src/c/hot.py");
+    assert_eq!(changed[0]["deltas"]["churn"], 5.0);
+
+    for (other, reason) in [
+        (ordinary_head, "unpinned report"),
+        (pinned(h, h), "different base maps"),
+    ] {
+        write_reports(&pinned_base, &other);
+        let refusal = run_debt(&diff_args);
+        assert_eq!(refusal.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&refusal.stderr).contains(reason));
+    }
+}
+
+#[test]
+fn debt_pin_places_new_files_using_only_outgoing_edges_to_base_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_path = dir.path().join("base.json");
+    let head_path = dir.path().join("head.json");
+    let base = synthetic();
+    std::fs::write(&base_path, serde_json::to_vec(&base).unwrap()).unwrap();
+    let mut head = base.clone();
+    // Replace the base's isolated file and add three new files. Give them
+    // equal high metrics so each has a god-file row with its assigned district.
+    head.files[14] = "z/isolated.py".into();
+    head.files
+        .extend(["placed.py", "a/chain.py", "tie.py"].map(str::to_owned));
+    let mut new_node = head.nodes[14].clone();
+    new_node.0 .4 = 80;
+    new_node.0 .6 = 20.0;
+    head.nodes[14] = new_node.clone();
+    head.nodes
+        .extend([new_node.clone(), new_node.clone(), new_node]);
+    head.edges.extend([
+        [16, 1],
+        [16, 3],
+        [16, 4], // b wins 2 to 1
+        [18, 3],
+        [18, 1], // a wins the tie by id
+        [3, 17],
+        [17, 16], // b -> unplaced -> b would enter the existing cycle
+    ]);
+    std::fs::write(&head_path, serde_json::to_vec(&head).unwrap()).unwrap();
+    let args = [
+        "--map",
+        head_path.to_str().unwrap(),
+        "--partition-from",
+        base_path.to_str().unwrap(),
+    ];
+    let report =
+        debt_json(&[&args[..], &["--format", "json", "--cycle-evidence", "full"]].concat());
+    assert!(report["partition"]["base_commit"].is_null());
+    assert_eq!(report["partition"]["placed_new_files"], 2);
+    assert_eq!(report["partition"]["unplaced_new_files"], 2);
+    assert_eq!(
+        report["partition"]["unplaced_paths"],
+        serde_json::json!(["a/chain.py", "z/isolated.py"])
+    );
+    assert_eq!(report["files"], 19);
+    let god_files = report["god_files"].as_array().unwrap();
+    let district = |path: &str| {
+        god_files.iter().find(|row| row["path"] == path).unwrap()["district"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(district("placed.py"), 1);
+    assert_eq!(district("tie.py"), 0);
+    assert_eq!(district("a/chain.py"), district("z/isolated.py"));
+    assert!(report["cycles"].as_array().unwrap().iter().all(|cycle| {
+        cycle["districts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["id"] != district("a/chain.py"))
+    }));
+    let filtered =
+        debt_json(&[&args[..], &["--format", "json", "--district", "(unplaced)"]].concat());
+    assert_eq!(filtered["god_files"].as_array().unwrap().len(), 2);
+    assert!(filtered["cycles"].as_array().unwrap().is_empty());
+    let text = run_debt(&args);
+    assert_eq!(text.status.code(), Some(0));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("partition pinned to base map sha256"));
+    assert!(text.contains("2 new files placed, 2 new files in (unplaced)"));
+    assert!(text.contains("a/chain.py"));
 }
 
 // Issue #250's comparison test: compared on the base map, a cycle broken by
