@@ -849,17 +849,21 @@ fn compact(
             })
             .collect()
     });
+    let rust_submodule_fanin = (!layout.weighted.rust_submodule_fanin.is_empty())
+        .then(|| layout.weighted.rust_submodule_fanin.clone());
     let debt = (cochange.is_some()
         || rust_mod.is_some()
         || build_entries.is_some()
         || generated.is_some()
-        || package_roots.is_some())
+        || package_roots.is_some()
+        || rust_submodule_fanin.is_some())
     .then_some(DebtSidecar {
         cochange,
         rust_mod,
         build_entries,
         generated,
         package_roots,
+        rust_submodule_fanin,
     });
     let mut groups = BTreeMap::<usize, Vec<usize>>::new();
     for (index, &district) in layout.membership.iter().enumerate() {

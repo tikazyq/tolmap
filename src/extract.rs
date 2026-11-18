@@ -6833,6 +6833,9 @@ fn finish_graph(
         .collect();
 
     let entry_points = crate::entry_points::detect(repo, &nodes);
+    let rust_submodule_fanin = rust_mod.as_ref().map_or_else(Vec::new, |tree| {
+        rust_submodule_fanin(tree, &directed, &fanin)
+    });
     Ok(GraphData {
         entry_points,
         repo: repo
@@ -6861,6 +6864,7 @@ fn finish_graph(
         commits_scanned: history.commits,
         cochange: Some(cochange),
         rust_mod,
+        rust_submodule_fanin,
         generated,
         build_entries,
         package_roots,
@@ -6870,6 +6874,51 @@ fn finish_graph(
         build_output_mirror,
         python_cross_project,
     })
+}
+
+/// Record the portion of map fan-in due to imports from Rust descendants.
+/// Round before taking the difference so subtraction from the two-decimal
+/// node fan-in does not leave residual mass when all importers are internal.
+fn rust_submodule_fanin(
+    tree: &RustModTree,
+    directed: &BTreeMap<(FileId, FileId), f64>,
+    fanin: &BTreeMap<FileId, f64>,
+) -> Vec<(FileId, f64)> {
+    let mut parents = BTreeMap::<FileId, Vec<FileId>>::new();
+    for &(parent, child) in &tree.pairs {
+        parents.entry(child).or_default().push(parent);
+    }
+    let mut excluded = BTreeMap::<FileId, f64>::new();
+    for (&source, direct_parents) in &parents {
+        let mut imports = directed
+            .range((source, FileId::MIN)..=(source, FileId::MAX))
+            .peekable();
+        if imports.peek().is_none() {
+            continue;
+        }
+        let mut ancestors = BTreeSet::from([source]);
+        let mut pending = direct_parents.clone();
+        while let Some(parent) = pending.pop() {
+            if ancestors.insert(parent) {
+                pending.extend(parents.get(&parent).into_iter().flatten().copied());
+            }
+        }
+        ancestors.remove(&source);
+        for (&(_, target), &weight) in imports {
+            if ancestors.contains(&target) {
+                *excluded.entry(target).or_default() += weight;
+            }
+        }
+    }
+    excluded
+        .into_iter()
+        .filter_map(|(file, mass)| {
+            let raw = fanin[&file];
+            let adjusted = round_to((raw - mass).max(0.0), 2);
+            let deduction = round_to(round_to(raw, 2) - adjusted, 2);
+            (deduction > 0.0).then_some((file, deduction))
+        })
+        .collect()
 }
 
 /// The largest static edge value per language, floored at 1.0 -- see the
@@ -10115,6 +10164,26 @@ mod tests {
                 .generator,
             None,
             "multiple derived types leave the generator unresolved"
+        );
+    }
+
+    #[test]
+    fn submodule_fanin_excludes_only_upward_import_mass() {
+        let tree = RustModTree {
+            roots: BTreeSet::from([0]),
+            pairs: BTreeSet::from([(0, 1), (0, 4), (1, 2), (2, 3)]),
+        };
+        let directed = BTreeMap::from([
+            ((1, 2), 1.0),
+            ((2, 1), 0.5),
+            ((3, 1), 0.25),
+            ((3, 0), 0.125),
+            ((4, 1), 1.0),
+        ]);
+        let fanin = BTreeMap::from([(0, 0.125), (1, 1.75), (2, 1.0)]);
+        assert_eq!(
+            rust_submodule_fanin(&tree, &directed, &fanin),
+            [(0, 0.13), (1, 0.75)]
         );
     }
 

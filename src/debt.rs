@@ -13,7 +13,7 @@
 //! Plain `//` comments on exported types, not doc comments: ts-rs copies doc
 //! comments into the bindings.
 use crate::cycle_cut::{greedy_cut, mutual_pairs, Bundles};
-use crate::extract::COCHANGE_MIN_COUNT;
+use crate::extract::{round_to, COCHANGE_MIN_COUNT};
 use crate::lens::{
     self, FileRename, HopMode, Lens, LensArea, LensColor, LensNote, LensPath, LensReport, LensStop,
     LENS_VERSION,
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use ts_rs::TS;
 
-pub const DEBT_REPORT_VERSION: u32 = 8;
+pub const DEBT_REPORT_VERSION: u32 = 9;
 
 // ---- thresholds ------------------------------------------------------------
 
@@ -114,8 +114,7 @@ pub struct DebtThresholds {
     pub misplaced_min_edges: usize,
     pub misplaced_min_share: f64,
     pub god_top_fraction: f64,
-    // The nearest-rank cuts the fraction gives on this map; null when no file
-    // has a positive value.
+    // Nearest-rank cuts from the base map when pinned, otherwise this map.
     pub god_min_fanin: Option<f64>,
     pub god_min_complexity: Option<usize>,
     pub hotspot_top_fraction: f64,
@@ -228,6 +227,7 @@ pub struct GodFile {
     pub path: String,
     pub district: usize,
     pub fanin: f64,
+    pub raw_fanin: f64,
     pub fanin_rank: usize,
     pub complexity: usize,
     pub complexity_rank: usize,
@@ -297,6 +297,7 @@ pub enum CycleEvidence {
 pub struct PinnedBase {
     pub map_sha256: String,
     pub commit: Option<String>,
+    pub thresholds_from_base: bool,
     // Files absent from the base that took a base district by edge weight.
     pub placed_new_files: usize,
     // Files absent from the base with no edge to a placed file.
@@ -334,6 +335,7 @@ pub struct DebtReport {
     pub cycles: Vec<DistrictCycle>,
     pub misplaced: Vec<MisplacedFile>,
     pub god_files: Vec<GodFile>,
+    pub rust_submodule_fanin_measured: bool,
     pub hotspots: Vec<Hotspot>,
     /// Test files use the same path rule as no-inbound entry files and are
     /// excluded from production hotspot ranking.
@@ -780,13 +782,77 @@ fn cycles(map: &MapDocument, unplaced: Option<usize>) -> Vec<DistrictCycle> {
     cycles
 }
 
+struct FileCuts {
+    fanin: Option<f64>,
+    complexity: Option<usize>,
+    hotspot_score: Option<usize>,
+}
+
+struct FileScores {
+    fanin: Vec<f64>,
+    complexity: Vec<usize>,
+    hotspot_scores: Vec<Option<usize>>,
+    rust_submodule_fanin_measured: bool,
+}
+
+impl FileScores {
+    fn new(map: &MapDocument) -> Self {
+        let mut fanin = map
+            .nodes
+            .iter()
+            .map(|node| node.fanin())
+            .collect::<Vec<_>>();
+        let excluded = map
+            .debt
+            .as_ref()
+            .and_then(|debt| debt.rust_submodule_fanin.as_ref());
+        for &(file, mass) in excluded.into_iter().flatten() {
+            if let Some(value) = fanin.get_mut(file as usize) {
+                *value = round_to((*value - mass).max(0.0), 2);
+            }
+        }
+        Self {
+            fanin,
+            complexity: map.nodes.iter().map(|node| node.complexity()).collect(),
+            hotspot_scores: map
+                .files
+                .iter()
+                .zip(&map.nodes)
+                .map(|(path, node)| {
+                    (!is_test_path(path) && !is_non_production_path(path))
+                        .then(|| node.churn() * node.complexity())
+                })
+                .collect(),
+            rust_submodule_fanin_measured: excluded.is_some(),
+        }
+    }
+
+    fn cuts(&self) -> FileCuts {
+        let production_scores = self
+            .hotspot_scores
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        FileCuts {
+            fanin: top_cut(&self.fanin, GOD_TOP_FRACTION, 1),
+            complexity: top_cut(&self.complexity, GOD_TOP_FRACTION, 1),
+            hotspot_score: top_cut(&production_scores, HOTSPOT_TOP_FRACTION, HOTSPOT_MIN_COUNT),
+        }
+    }
+}
+
 pub fn findings(map: &MapDocument) -> DebtReport {
-    findings_with_unplaced(map, None)
+    findings_with_unplaced(map, None, None)
 }
 
 // `unplaced` is the district id that stands for files with no base district:
 // they take part in file-level findings but in no district cycle or tally.
-fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtReport {
+fn findings_with_unplaced(
+    map: &MapDocument,
+    unplaced: Option<usize>,
+    pinned_cuts: Option<FileCuts>,
+) -> DebtReport {
     let n = map.files.len();
     let district = |f: usize| map.nodes[f].district();
     let file_edges = map
@@ -916,10 +982,18 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
         .count();
     misplaced.retain(|file| !generated_paths.contains(file.path.as_str()));
 
-    let fanin: Vec<f64> = map.nodes.iter().map(|r| r.fanin()).collect();
-    let complexity: Vec<usize> = map.nodes.iter().map(|r| r.complexity()).collect();
-    let god_min_fanin = top_cut(&fanin, GOD_TOP_FRACTION, 1);
-    let god_min_complexity = top_cut(&complexity, GOD_TOP_FRACTION, 1);
+    let scores = FileScores::new(map);
+    let FileCuts {
+        fanin: god_min_fanin,
+        complexity: god_min_complexity,
+        hotspot_score: hotspot_min_score,
+    } = pinned_cuts.unwrap_or_else(|| scores.cuts());
+    let FileScores {
+        fanin,
+        complexity,
+        hotspot_scores,
+        rust_submodule_fanin_measured,
+    } = scores;
     let mut god_files: Vec<GodFile> = match (god_min_fanin, god_min_complexity) {
         (Some(cf), Some(cc)) => (0..n)
             .filter(|&f| fanin[f] >= cf && complexity[f] >= cc)
@@ -927,6 +1001,7 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
                 path: map.files[f].clone(),
                 district: district(f),
                 fanin: fanin[f],
+                raw_fanin: map.nodes[f].fanin(),
                 fanin_rank: rank(&fanin, &fanin[f]),
                 complexity: complexity[f],
                 complexity_rank: rank(&complexity, &complexity[f]),
@@ -941,11 +1016,6 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
             .then(a.path.cmp(&b.path))
     });
 
-    let score: Vec<usize> = map
-        .nodes
-        .iter()
-        .map(|r| r.churn() * r.complexity())
-        .collect();
     // Tests churn with production work, but they are not production change
     // hotspots. Storybook is likewise non-production, without becoming a
     // test or an entry for any other finding.
@@ -953,31 +1023,26 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
     let non_production_hotspot_files_excluded = (0..n)
         .filter(|&f| is_non_production_path(&map.files[f]))
         .count();
-    let production =
-        |f: usize| !is_test_path(&map.files[f]) && !is_non_production_path(&map.files[f]);
-    let production_scores = (0..n)
-        .filter(|&f| production(f))
-        .map(|f| score[f])
+    let mut hot = hotspot_scores
+        .into_iter()
+        .enumerate()
+        .filter_map(|(file, score)| {
+            let score = score?;
+            (score >= hotspot_min_score?).then_some((file, score))
+        })
         .collect::<Vec<_>>();
-    let hotspot_min_score = top_cut(&production_scores, HOTSPOT_TOP_FRACTION, HOTSPOT_MIN_COUNT);
-    let mut hot: Vec<usize> = match hotspot_min_score {
-        Some(cut) => (0..n)
-            .filter(|&f| production(f) && score[f] >= cut)
-            .collect(),
-        None => vec![],
-    };
     // Stable: ties keep map order, as `pipeline::landmarks` orders hazards.
-    hot.sort_by_key(|&f| std::cmp::Reverse(score[f]));
+    hot.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
     let hotspots = hot
         .into_iter()
         .enumerate()
-        .map(|(i, f)| Hotspot {
+        .map(|(i, (f, score))| Hotspot {
             path: map.files[f].clone(),
             district: district(f),
             rank: i + 1,
             churn: map.nodes[f].churn(),
             complexity: complexity[f],
-            score: score[f],
+            score,
         })
         .collect();
 
@@ -1176,6 +1241,7 @@ fn findings_with_unplaced(map: &MapDocument, unplaced: Option<usize>) -> DebtRep
         cycles: cycles(map, unplaced),
         misplaced,
         god_files,
+        rust_submodule_fanin_measured,
         hotspots,
         test_hotspot_files_excluded,
         non_production_hotspot_files_excluded,
@@ -1455,12 +1521,18 @@ pub fn to_lens(report: &DebtReport, map: &MapDocument) -> Lens {
         );
         add(&mut kinds, KIND_MISPLACED, [m.path.as_str()]);
     }
+    let cutoff_source = if report.pinned.is_some() {
+        "base"
+    } else {
+        "map"
+    };
     for g in &report.god_files {
         note(
             &g.path,
             format!(
-                "god file: fan-in {} (rank {}), complexity {} (rank {}); both in the top {} (fan-in ≥ {}, complexity ≥ {})",
+                "god file: fan-in {} (raw {}, rank {}), complexity {} (rank {}); top {} cutoffs from {cutoff_source} (fan-in ≥ {}, complexity ≥ {})",
                 g.fanin,
+                g.raw_fanin,
                 g.fanin_rank,
                 g.complexity,
                 g.complexity_rank,
@@ -1475,7 +1547,7 @@ pub fn to_lens(report: &DebtReport, map: &MapDocument) -> Lens {
         note(
             &h.path,
             format!(
-                "hotspot #{}: churn {} × complexity {} = {} (top {}, at least {}; score ≥ {}; {} test files and {} non-production files excluded)",
+                "hotspot #{}: churn {} × complexity {} = {} (top {}, at least {} in {cutoff_source}; score ≥ {}; {} test files and {} non-production files excluded)",
                 h.rank,
                 h.churn,
                 h.complexity,
@@ -1615,6 +1687,7 @@ fn render_text_with_files(report: &DebtReport, files: Option<&[String]>) -> Stri
             pin.placed_new_files,
             pin.unplaced_new_files
         );
+        out.push_str("god-file and hotspot cutoffs are from the base map\n");
     }
     if report.cycle_evidence == CycleEvidence::Compact {
         out.push_str("cycle evidence: compact (use --cycle-evidence full for bundles)\n");
@@ -1652,6 +1725,9 @@ fn render_text_with_files(report: &DebtReport, files: Option<&[String]>) -> Stri
     );
     if !report.generated_file_measurement {
         out.push_str("generated-file handling not measured (map has no generated-file sidecar)\n");
+    }
+    if !report.rust_submodule_fanin_measured {
+        out.push_str("Rust submodule fan-in adjustment not measured (map has no sidecar)\n");
     }
     if report.rust_mod_reachability_measured {
         let _ = writeln!(
@@ -1757,8 +1833,8 @@ fn render_text_with_files(report: &DebtReport, files: Option<&[String]>) -> Stri
     for g in &report.god_files {
         let _ = writeln!(
             out,
-            "god {}: fan-in {}, complexity {}",
-            g.path, g.fanin, g.complexity
+            "god {}: fan-in {} (raw {}), complexity {}",
+            g.path, g.fanin, g.raw_fanin, g.complexity
         );
     }
     for h in &report.hotspots {
@@ -2028,10 +2104,16 @@ pub fn findings_pinned(
     base_commit: Option<String>,
 ) -> (MapDocument, DebtReport) {
     let (relabeled, placed, unplaced, left) = relabel_to_base(head, base);
-    let mut report = findings_with_unplaced(&relabeled, (!left.is_empty()).then_some(unplaced));
+    let base_cuts = FileScores::new(base).cuts();
+    let mut report = findings_with_unplaced(
+        &relabeled,
+        (!left.is_empty()).then_some(unplaced),
+        Some(base_cuts),
+    );
     report.pinned = Some(PinnedBase {
         map_sha256: base_sha256,
         commit: base_commit,
+        thresholds_from_base: true,
         placed_new_files: placed,
         unplaced_new_files: left.len(),
         unplaced_paths: left,

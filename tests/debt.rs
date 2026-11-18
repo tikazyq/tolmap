@@ -626,6 +626,76 @@ fn pinned_report_keeps_base_districts_and_only_the_change_differs() {
 }
 
 #[test]
+fn pinned_cutoffs_do_not_move_when_a_low_score_file_is_added() {
+    let mut base = synthetic();
+    base.edges.clear();
+    base.landmarks.clear();
+    base.files = (1..=40)
+        .rev()
+        .map(|score| format!("src/{score}.py"))
+        .collect();
+    base.nodes = (1..=40)
+        .rev()
+        .map(|score| {
+            tolmap::schema::NodeRow((0, 0.0, 0.0, 10, score, 1, score as f64, 0.0, 0.0, 0.0, 0.0))
+        })
+        .collect();
+    let mut head = base.clone();
+    head.files.push("src/new.py".to_owned());
+    head.nodes.push(base.nodes.last().unwrap().clone());
+
+    let plain = debt::findings(&head);
+    assert_eq!(plain.god_files[2].path, "src/38.py");
+    assert_eq!(plain.hotspots[2].path, "src/38.py");
+
+    let (_, report) = pinned(&head, &base, "sha");
+    assert!(report.pinned.unwrap().thresholds_from_base);
+    assert_eq!(report.thresholds.god_min_fanin, Some(39.0));
+    assert_eq!(report.thresholds.god_min_complexity, Some(39));
+    assert_eq!(report.thresholds.hotspot_min_score, Some(39));
+    assert_eq!(
+        paths(report.god_files.iter().map(|file| &file.path)),
+        ["src/40.py", "src/39.py"]
+    );
+    assert_eq!(
+        paths(report.hotspots.iter().map(|file| &file.path)),
+        ["src/40.py", "src/39.py"]
+    );
+
+    head.nodes.last_mut().unwrap().0 .5 = 100;
+    head.nodes.last_mut().unwrap().0 .6 = 50.0;
+    let (_, report) = pinned(&head, &base, "sha");
+    assert_eq!(report.god_files[0].fanin_rank, 2);
+    assert_eq!(report.hotspots[0].path, "src/new.py");
+    assert_eq!(report.hotspots[1].rank, 2);
+}
+
+#[test]
+fn god_file_fanin_uses_submodule_adjustment_for_cuts_and_ranks() {
+    let old_map = synthetic();
+    let old = debt::findings(&old_map);
+    assert!(!old.rust_submodule_fanin_measured);
+    assert_eq!(old.god_files[0].fanin, old.god_files[0].raw_fanin);
+    assert!(debt::render_text(&old).contains("Rust submodule fan-in adjustment not measured"));
+
+    let mut value = serde_json::to_value(old_map).unwrap();
+    value["D"] = serde_json::json!({"rust_submodule_fanin": [[11, 6.5]]});
+    let map: MapDocument = serde_json::from_value(value).unwrap();
+    let report = debt::findings(&map);
+    assert!(report.rust_submodule_fanin_measured);
+    assert_eq!(report.thresholds.god_min_fanin, Some(2.5));
+    let god = &report.god_files[0];
+    assert_eq!((god.fanin, god.raw_fanin, god.fanin_rank), (2.5, 9.0, 1));
+
+    let mut head = map.clone();
+    head.nodes[1].0 .6 = 3.0;
+    assert!(debt::findings(&head).god_files.is_empty());
+    let (_, pinned_report) = pinned(&head, &map, "sha");
+    assert_eq!(pinned_report.thresholds.god_min_fanin, Some(2.5));
+    assert_eq!(pinned_report.god_files[0].fanin_rank, 2);
+}
+
+#[test]
 fn pinned_report_to_the_same_map_is_the_unpinned_report() {
     let base = synthetic();
     let (_, report) = pinned(&base, &base, "sha");

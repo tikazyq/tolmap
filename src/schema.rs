@@ -407,6 +407,9 @@ pub struct DebtSidecar {
     pub generated: Option<Vec<GeneratedFile>>,
     #[serde(default)]
     pub package_roots: Option<Vec<PackageRoot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rust_submodule_fanin: Option<Vec<(u32, f64)>>,
 }
 
 /// A package manifest root, relative to the repository. The root directory
@@ -712,6 +715,7 @@ pub struct GraphData {
     /// Rust's resolved declaration tree. It stays out of graph JSON and the
     /// blend/partition inputs, then becomes the optional compact debt sidecar.
     pub rust_mod: Option<RustModTree>,
+    pub rust_submodule_fanin: Vec<(FileId, f64)>,
     /// Files named by statically readable bundler configuration. `None`
     /// means a relevant config could not be read statically; `Some(empty)`
     /// means configs were measured and named no mapped source file.
@@ -898,6 +902,7 @@ impl<'de> Deserialize<'de> for GraphData {
             commits_scanned: wire.commits_scanned,
             cochange: None,
             rust_mod: None,
+            rust_submodule_fanin: Vec::new(),
             build_entries: None,
             generated: None,
             package_roots: None,
@@ -965,6 +970,7 @@ mod tests {
             commits_scanned: 0,
             cochange: None,
             rust_mod: None,
+            rust_submodule_fanin: Vec::new(),
             build_entries: None,
             generated: None,
             package_roots: None,
@@ -1035,6 +1041,7 @@ mod tests {
             commits_scanned: 0,
             cochange: None,
             rust_mod: None,
+            rust_submodule_fanin: Vec::new(),
             build_entries: None,
             generated: None,
             package_roots: None,
@@ -1070,6 +1077,7 @@ mod tests {
             commits_scanned: 0,
             cochange: None,
             rust_mod: None,
+            rust_submodule_fanin: Vec::new(),
             build_entries: None,
             generated: None,
             package_roots: None,

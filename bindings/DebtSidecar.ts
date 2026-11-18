@@ -8,4 +8,4 @@ import type { RustModSidecar } from "./RustModSidecar";
 /**
  * Optional debt evidence, indexed against `MapDocument::files`.
  */
-export type DebtSidecar = { cochange: CochangeSidecar | null, rust_mod: RustModSidecar | null, build_entries: BuildEntrySidecar | null, generated: Array<GeneratedFile> | null, package_roots: Array<PackageRoot> | null, };
+export type DebtSidecar = { cochange: CochangeSidecar | null, rust_mod: RustModSidecar | null, build_entries: BuildEntrySidecar | null, generated: Array<GeneratedFile> | null, package_roots: Array<PackageRoot> | null, rust_submodule_fanin?: Array<[number, number]> | null, };

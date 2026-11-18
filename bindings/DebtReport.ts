@@ -24,7 +24,7 @@ filters?: DebtFilters | null,
 /**
  * Counts after applying the selected CLI filters and ranking limit.
  */
-filtered_counts?: { [key in string]: number } | null, lower_bound: boolean, files: number, edges: number, thresholds: DebtThresholds, coverage: CoverageReport | null, cycles: Array<DistrictCycle>, misplaced: Array<MisplacedFile>, god_files: Array<GodFile>, hotspots: Array<Hotspot>, 
+filtered_counts?: { [key in string]: number } | null, lower_bound: boolean, files: number, edges: number, thresholds: DebtThresholds, coverage: CoverageReport | null, cycles: Array<DistrictCycle>, misplaced: Array<MisplacedFile>, god_files: Array<GodFile>, rust_submodule_fanin_measured: boolean, hotspots: Array<Hotspot>, 
 /**
  * Test files use the same path rule as no-inbound entry files and are
  * excluded from production hotspot ranking.

@@ -154,7 +154,7 @@ text, JSON and lens TOML;
 all outputs identify the selections (lens TOML uses a leading comment, which is
 valid TOML and ignored by `tolmap lens check`). Filtered JSON keeps the normal
 DebtReport version and lower-bound evidence, with additive `unfiltered_counts`,
-`filtered_counts` and `filters` fields. DebtReport is now v8 (v8 adds the optional `pinned` object below): `cycle_evidence` is
+`filtered_counts` and `filters` fields. DebtReport is now v9: `cycle_evidence` is
 `compact` by default for CLI text/JSON. Compact cycles retain member districts,
 `cross_edges`, one `route` and its `closing_edges`, package names and measurement
 flags. Their `package_edges`, `mutual_pairs` and `cut` arrays are empty;
@@ -175,10 +175,12 @@ counted. An unplaced file appears in file-level findings (god, hotspot,
 no-inbound, hidden coupling), shown under a district named `(unplaced)`, but in
 no district cycle or misplaced finding: its edges have no district side. Files
 only in the base are absent.
-Extraction, partitioning and layout are unchanged: only the report is. The
-report gains `pinned`: `map_sha256` and `commit` of the base (`commit` is null
-when the base records none), `placed_new_files`, `unplaced_new_files` and the sorted `unplaced_paths`.
-Unpinned reports omit `pinned`.
+Pinning changes only the report. The nearest-rank cuts for god-file fan-in,
+god-file complexity and production hotspot score come from the base map, but
+file ranks are computed on the head. The report gains `pinned`: `map_sha256`
+and `commit` of the base (`commit` is null when the base records none),
+`thresholds_from_base: true`, `placed_new_files`, `unplaced_new_files` and the
+sorted `unplaced_paths`. Unpinned reports use their own cutoffs and omit `pinned`.
 
 `tolmap debt diff <before-report.json> <after-report.json>` compares two unfiltered,
 versioned DebtReports. It emits version 2 JSON with each finding marked `added`,
@@ -235,7 +237,12 @@ be missed, so this too is a lower bound. Older maps report
 readable build configurations retain literal bundler entries in the same sidecar;
 older or dynamically configured maps report that entry evidence as unmeasured.
 Test paths use the no-inbound test rule and are excluded from production hotspot
-ranking, with the count reported. Files with no edge at all are coverage gaps:
+ranking, with the count reported. God-file `fanin` and `fanin_rank` exclude
+imports from a Rust file's own descendants in the resolved `mod` tree.
+`raw_fanin` is the unchanged fan-in from the map node. Extraction records
+nonzero deductions at node precision in `D.rust_submodule_fanin` as
+`[file index, deduction]` pairs. A map without those pairs uses raw fan-in
+and reports `rust_submodule_fanin_measured: false`. Files with no edge at all are coverage gaps:
 they are counted in `isolated_files`, not listed. Every report
 states its thresholds (named constants in `src/debt.rs`, plus the cuts they
 give on this map) and echoes the map's `coverage`; every count is a lower
