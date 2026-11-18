@@ -2785,6 +2785,69 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_rejects_a_result_over_the_lease_name_limit_before_any_put() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (context, _received) = job_context(dir.path(), listener.local_addr().unwrap().port());
+        let job_dir = dir.path().join("job");
+        let output_dir = job_dir.join("output");
+        let map = output_dir.join("demo.json");
+        let symbols = output_dir.join("demo.symbols.json");
+        let symbols_dir = output_dir.join("demo.symbols");
+        let names = output_dir.join("demo.names.json");
+        std::fs::create_dir_all(&symbols_dir).unwrap();
+        std::fs::write(&map, br#"{"F": [], "districts": {}}"#).unwrap();
+        std::fs::write(&symbols, b"{}").unwrap();
+        // Map and symbols use two names of their own. The identical tiny
+        // district files stay well within the per-file and lease byte limits.
+        for index in 0..worker_result::LEASE_MAX_ARTIFACTS - 1 {
+            std::fs::write(symbols_dir.join(format!("{index}.json")), b"{}").unwrap();
+        }
+        let executed = Executed {
+            output: executor::WorkerOutput {
+                map_path: map.to_str().unwrap().to_owned(),
+                symbols_path: symbols.to_str().unwrap().to_owned(),
+                symbols_dir: symbols_dir.to_str().unwrap().to_owned(),
+                names_cache: names.to_str().unwrap().to_owned(),
+                commit: context.job.commit.clone(),
+                lang: "py".to_owned(),
+                files: 0,
+                districts: 0,
+                modularity: 0.0,
+            },
+            checkout: crate::service::clone::Materialized {
+                path: job_dir.clone(),
+                commit: context.job.commit.clone(),
+                branch: None,
+            },
+            job_dir,
+            output_dir,
+        };
+        let probe = AgentProbe {
+            cancel: context.cancel.clone(),
+            child: context.child.clone(),
+        };
+        let server = std::thread::spawn(move || serve_413(listener, Duration::from_millis(100)));
+        let outcome = context.upload(
+            &http_agent(&context.endpoint),
+            Uuid::parse_str(&context.job_id).unwrap(),
+            &executed,
+            &probe,
+        );
+
+        assert_eq!(server.join().unwrap(), 0, "the mock must see no PUTs");
+        let Outcome::Failed(error) = outcome else {
+            panic!("the agent accepted a result with too many names");
+        };
+        assert_eq!(error.error, "invalid_worker_result", "{}", error.message);
+        assert!(
+            error.message.contains("one lease may hold"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
     fn an_agent_rejects_a_names_cache_over_its_shared_cap_before_the_put() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();

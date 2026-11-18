@@ -1194,13 +1194,12 @@ struct Conn {
     local_paths: bool,
     ready: bool,
     draining: bool,
-    /// The job whose lease this channel holds, including a cancelled job
-    /// until `released` arrives or the lease expires (§2.4).
-    holding: Option<Uuid>,
     /// The origin the agent dialled (`WorkerHub::origin`): the base of the
     /// artifact URLs in its `assign`s.
     base_url: String,
     out: tokio::sync::mpsc::UnboundedSender<Outgoing>,
+    /// Dropping this interrupts socket I/O, even if the peer has stopped reading.
+    _disconnect: tokio::sync::oneshot::Sender<()>,
 }
 
 /// An uploaded artifact, stored content-addressed at `<lease dir>/blobs/
@@ -1751,37 +1750,25 @@ impl WorkerHub {
             .unwrap_or_else(|| self.base_url.clone())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn add_conn(
-        &self,
-        agent: usize,
-        worker_id: String,
-        eligible: bool,
-        class: Option<usize>,
-        local_paths: bool,
-        base_url: String,
-        out: tokio::sync::mpsc::UnboundedSender<Outgoing>,
-    ) -> u64 {
+    fn join(&self, conn: Conn, resume: Vec<ResumeEntry>) -> Option<(u64, Vec<WelcomeResume>)> {
         let mut inner = self.lock();
+        if inner.stopping {
+            return None;
+        }
+        let agent = conn.agent;
+        let mut channels = inner.conns.iter().filter(|(_, conn)| conn.agent == agent);
+        let oldest = channels.next().map(|(&id, _)| id);
+        // Allow the current channel and one reconnect. At capacity the
+        // newest hello wins, even if both old sockets still look alive.
+        if let Some(oldest) = oldest.filter(|_| channels.next().is_some()) {
+            self.detach_conn(&mut inner, oldest);
+        }
         let id = inner.next_conn;
         inner.next_conn += 1;
-        inner.conns.insert(
-            id,
-            Conn {
-                agent,
-                worker_id,
-                eligible,
-                class,
-                local_paths,
-                ready: false,
-                draining: false,
-                holding: None,
-                base_url,
-                out,
-            },
-        );
+        inner.conns.insert(id, conn);
+        let answers = self.resume(&mut inner, id, agent, resume);
         self.changed.notify_all();
-        id
+        Some((id, answers))
     }
 
     /// A closed channel does not end its lease (§6 "channel lost, worker
@@ -1789,14 +1776,19 @@ impl WorkerHub {
     /// new channel within the TTL (`resume`) or it runs out at its deadline
     /// and the runner re-queues the job.
     fn remove_conn(&self, conn_id: u64) {
-        let mut guard = self.lock();
-        let inner = &mut *guard;
-        if let Some(conn) = inner.conns.remove(&conn_id) {
-            eprintln!(
-                "worker agent {} ({}) disconnected",
-                conn.agent, conn.worker_id
-            );
-        }
+        self.detach_conn(&mut self.lock(), conn_id);
+        self.changed.notify_all();
+    }
+
+    fn detach_conn(&self, inner: &mut HubInner, conn_id: u64) {
+        let Some(conn) = inner.conns.remove(&conn_id) else {
+            return;
+        };
+        eprintln!(
+            "worker agent {} ({}) disconnected",
+            conn.agent, conn.worker_id
+        );
+        drop(conn);
         for (job_id, lease) in inner.leases.iter_mut() {
             if lease.conn == Some(conn_id) {
                 lease.conn = None;
@@ -1808,7 +1800,6 @@ impl WorkerHub {
                 );
             }
         }
-        self.changed.notify_all();
     }
 
     fn handle(&self, conn_id: u64, message: WorkerMessage) -> Result<(), Violation> {
@@ -2141,7 +2132,6 @@ impl WorkerHub {
                 let (events, receiver) = std_mpsc::channel();
                 let conn = inner.conns.get_mut(&conn_id).expect("picked from conns");
                 conn.ready = false;
-                conn.holding = Some(job_id);
                 let agent = conn.agent;
                 // The store's `lease_holder`. In remote mode it is the
                 // worker id the agent's token is bound to (`serve_agent`
@@ -2180,9 +2170,8 @@ impl WorkerHub {
                         dir: dir.clone(),
                     },
                 );
-                if let Some(replaced) = &replaced {
-                    replaced.upload_cancel.send_replace(true);
-                }
+                // The old sender drops with the lease, waking its uploads.
+                let replaced = replaced.map(|lease| lease.dir);
                 self.changed.notify_all();
                 eprintln!("job {job_id}: assigned to worker agent {agent} (epoch {epoch})");
                 let claimed = Claimed {
@@ -2191,10 +2180,8 @@ impl WorkerHub {
                     holder,
                 };
                 drop(guard);
-                if let Some(replaced) = replaced {
-                    if replaced.dir != dir {
-                        let _ = std::fs::remove_dir_all(replaced.dir);
-                    }
+                if let Some(replaced) = replaced.filter(|old_dir| old_dir != &dir) {
+                    let _ = std::fs::remove_dir_all(replaced);
                 }
                 return Ok(Some(claimed));
             }
@@ -2228,18 +2215,10 @@ impl WorkerHub {
             _ => None,
         };
         let dir = self.lease_dir(job_id, epoch);
-        let replaced = {
-            let mut inner = self.lock();
-            let replaced = inner.leases.remove(&job_id);
-            if let Some(lease) = &replaced {
-                lease.upload_cancel.send_replace(true);
-            }
-            replaced
-        };
-        if let Some(replaced) = replaced {
-            if replaced.dir != dir {
-                let _ = std::fs::remove_dir_all(replaced.dir);
-            }
+        // Dropping the removed lease closes its upload watch and aborts its PUTs.
+        let replaced = self.lock().leases.remove(&job_id).map(|lease| lease.dir);
+        if let Some(replaced) = replaced.filter(|old_dir| old_dir != &dir) {
+            let _ = std::fs::remove_dir_all(replaced);
         }
         let _ = std::fs::remove_dir_all(&dir);
         // `blobs` too, as `claim` makes it: a lease resumed in remote mode
@@ -2276,14 +2255,11 @@ impl WorkerHub {
                 dir: dir.clone(),
             },
         );
-        if let Some(replaced) = &replaced {
-            replaced.upload_cancel.send_replace(true);
-        }
+        // Replacement also drops the old upload watch sender.
+        let replaced = replaced.map(|lease| lease.dir);
         drop(inner);
-        if let Some(replaced) = replaced {
-            if replaced.dir != dir {
-                let _ = std::fs::remove_dir_all(replaced.dir);
-            }
+        if let Some(replaced) = replaced.filter(|old_dir| old_dir != &dir) {
+            let _ = std::fs::remove_dir_all(replaced);
         }
         eprintln!(
             "job {job_id}: its lease (epoch {epoch}) survived a restart; it runs out within {} s",
@@ -2387,9 +2363,13 @@ impl WorkerHub {
     /// out, it ended, or a restarted loopback master adopted it (an adopted
     /// lease has a holder only in remote mode, where it is a worker id:
     /// `adopt`).
-    fn resume(&self, conn_id: u64, agent: usize, entries: Vec<ResumeEntry>) -> Vec<WelcomeResume> {
-        let mut guard = self.lock();
-        let inner = &mut *guard;
+    fn resume(
+        &self,
+        inner: &mut HubInner,
+        conn_id: u64,
+        agent: usize,
+        entries: Vec<ResumeEntry>,
+    ) -> Vec<WelcomeResume> {
         let now = Instant::now();
         let mut answers = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -2446,19 +2426,8 @@ impl WorkerHub {
                 answers.push(cancel(CancelReason::Reroute));
                 continue;
             }
-            if let Some(old) = lease.conn.filter(|old| *old != conn_id) {
-                if let Some(conn) = inner.conns.get_mut(&old) {
-                    if conn.holding == Some(id) {
-                        conn.holding = None;
-                    }
-                    let _ = conn.out.send(Outgoing::Close);
-                }
-            }
-            lease.conn = Some(conn_id);
+            let old = lease.conn.replace(conn_id);
             lease.deadline = now + self.lease_ttl;
-            if let Some(conn) = inner.conns.get_mut(&conn_id) {
-                conn.holding = Some(id);
-            }
             let acked_seq = lease.next_seq - 1;
             eprintln!(
                 "job {id}: worker agent {agent} resumed its lease (epoch {}) on a new channel; \
@@ -2466,8 +2435,10 @@ impl WorkerHub {
                 lease.epoch, entry.last_seq
             );
             answers.push(answer(ResumeAction::Continue, acked_seq, None));
+            if let Some(old) = old.filter(|old| *old != conn_id) {
+                self.detach_conn(inner, old);
+            }
         }
-        self.changed.notify_all();
         answers
     }
 
@@ -2512,18 +2483,13 @@ impl WorkerHub {
             let mut guard = self.lock();
             let inner = &mut *guard;
             let lease = inner.leases.remove(&job_id);
-            if let Some(lease) = &lease {
-                lease.upload_cancel.send_replace(true);
-                if let Some(conn) = lease.conn.and_then(|conn| inner.conns.get_mut(&conn)) {
-                    if conn.holding == Some(job_id) {
-                        conn.holding = None;
-                    }
-                    if close_channel {
-                        let _ = conn.out.send(Outgoing::Close);
-                    }
+            if close_channel {
+                if let Some(conn) = lease.as_ref().and_then(|lease| lease.conn) {
+                    self.detach_conn(inner, conn);
                 }
             }
             self.changed.notify_all();
+            // Dropping the lease closes the upload watch and wakes its PUTs.
             lease.map(|lease| lease.dir)
         };
         if let Some(dir) = dir {
@@ -2660,29 +2626,29 @@ impl Drop for UploadGuard<'_> {
 /// is the oldest connected agent, so the choice is deterministic for a
 /// given sequence of connections.
 fn pick_agent(inner: &HubInner, me: (i64, Uuid)) -> Option<u64> {
-    let mut taken = BTreeSet::new();
+    // A detached lease still holds its agent's slot until it ends.
+    let mut taken: BTreeSet<_> = inner
+        .leases
+        .values()
+        .filter_map(|lease| lease.agent)
+        .collect();
     for (&waiter, &(local, class)) in &inner.waiting {
         // Trust decision (§3.3): a `local/<name>` job names a path on this
         // host, so it goes only to an agent that said it shares this
         // host's paths.
-        let free = inner
-            .conns
-            .iter()
-            .find(|(id, conn)| {
-                !taken.contains(*id)
-                    && conn.eligible
-                    && conn.ready
-                    && !conn.draining
-                    && conn.holding.is_none()
-                    && conn.class == Some(class)
-                    && (!local || conn.local_paths)
-            })
-            .map(|(id, _)| *id);
+        let free = inner.conns.iter().find(|(_, conn)| {
+            !taken.contains(&conn.agent)
+                && conn.eligible
+                && conn.ready
+                && !conn.draining
+                && conn.class == Some(class)
+                && (!local || conn.local_paths)
+        });
         if waiter == me {
-            return free;
+            return free.map(|(&id, _)| id);
         }
-        if let Some(id) = free {
-            taken.insert(id);
+        if let Some((_, conn)) = free {
+            taken.insert(conn.agent);
         }
     }
     None
@@ -3024,16 +2990,25 @@ async fn serve_agent(
         .await;
         return;
     }
-    let (out, mut outgoing) = tokio::sync::mpsc::unbounded_channel();
-    let conn = hub.add_conn(
-        agent,
-        worker_id.clone(),
-        eligible,
-        worker_class,
-        local_paths,
-        origin,
-        out,
-    );
+    let (out, outgoing) = tokio::sync::mpsc::unbounded_channel();
+    let (disconnect, evicted) = tokio::sync::oneshot::channel();
+    let Some((conn, resume)) = hub.join(
+        Conn {
+            agent,
+            worker_id: worker_id.clone(),
+            eligible,
+            class: worker_class,
+            local_paths,
+            ready: false,
+            draining: false,
+            base_url: origin,
+            out,
+            _disconnect: disconnect,
+        },
+        resume,
+    ) else {
+        return;
+    };
     eprintln!(
         "worker agent {agent} ({worker_id}) connected: {} MiB usable (worker class {}), {} CPUs, \
          proto {proto}",
@@ -3048,19 +3023,38 @@ async fn serve_agent(
         proto,
         heartbeat_s: hub.heartbeat_s,
         lease_ttl_s: hub.lease_ttl_s(),
-        resume: hub.resume(conn, agent, resume),
+        resume,
     };
     // Off the hub's lock: a new agent may let a queued job start.
     hub.agents_changed();
+    tokio::select! {
+        biased;
+        // Eviction is a lost transport, even if an outbound send is blocked.
+        _ = evicted => {}
+        _ = serve_channel(&hub, &identity, conn, &mut socket, outgoing, &welcome) => {}
+    }
+    drop(socket);
+    hub.remove_conn(conn);
+    hub.agents_changed();
+}
+
+async fn serve_channel(
+    hub: &WorkerHub,
+    identity: &Identity,
+    conn: u64,
+    socket: &mut WebSocket,
+    mut outgoing: tokio::sync::mpsc::UnboundedReceiver<Outgoing>,
+    welcome: &MasterMessage,
+) {
     // §4.3: every frame after the `hello` spends from this channel's budget.
     let mut budget = FrameBudget::new(hub.frame_rate, hub.frame_burst);
-    if send_message(&mut socket, &welcome).await.is_ok() {
+    if send_message(socket, welcome).await.is_ok() {
         loop {
             tokio::select! {
                 incoming = socket.recv() => {
                     if matches!(incoming, Some(Ok(_))) && !budget.take() {
                         close_with_error(
-                            &mut socket,
+                            socket,
                             "rate_limited",
                             format!(
                                 "more than {} control frames a second (bursts of {}); the \
@@ -3075,7 +3069,7 @@ async fn serve_agent(
                         Some(Ok(Message::Text(text))) => text,
                         Some(Ok(Message::Binary(_))) => {
                             close_with_error(
-                                &mut socket,
+                                socket,
                                 "protocol_error",
                                 "binary frames are not part of the protocol".to_owned(),
                             )
@@ -3092,7 +3086,7 @@ async fn serve_agent(
                         // here, off the hub's lock, since it may read the
                         // token file.
                         if matches!(message, WorkerMessage::Heartbeat { .. })
-                            && !hub.still_authorized(&identity)
+                            && !hub.still_authorized(identity)
                         {
                             return Err(Violation {
                                 code: "token_revoked",
@@ -3104,13 +3098,13 @@ async fn serve_agent(
                         hub.handle(conn, message)
                     });
                     if let Err(violation) = handled {
-                        close_with_error(&mut socket, violation.code, violation.message).await;
+                        close_with_error(socket, violation.code, violation.message).await;
                         break;
                     }
                 }
                 message = outgoing.recv() => match message {
                     Some(Outgoing::Message(message)) => {
-                        if send_message(&mut socket, &message).await.is_err() {
+                        if send_message(socket, &message).await.is_err() {
                             break;
                         }
                     }
@@ -3122,8 +3116,6 @@ async fn serve_agent(
             }
         }
     }
-    hub.remove_conn(conn);
-    hub.agents_changed();
 }
 
 /// `GET` on an input URL from `assign` (§4.2).
@@ -6615,6 +6607,63 @@ mod tests {
     }
 
     #[test]
+    fn resuming_a_live_lease_keeps_its_in_flight_upload() {
+        use std::io::Write;
+
+        let fixture = Fixture::new(Duration::from_secs(60), test_build());
+        let (_agent, id, mut upload) = stalled_upload_on_a_lease_without_runner(&fixture);
+        let (_back, answers) =
+            FakeAgent::rejoin(fixture.port, TOKENS[0], vec![resume_entry(id, 1, 0)]);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].action, ResumeAction::Continue);
+        assert_eq!(raw_upload_state(&fixture, id), (1, 1));
+
+        // The stalled request declares the map's digest for a one-byte
+        // body. It must reach the digest check after the channel changes.
+        upload
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        upload.write_all(b"x").unwrap();
+        let response = response_text(&mut upload).unwrap();
+        assert_eq!(status_of(&response), 400);
+        assert!(response_body(&response).contains("digest mismatch"));
+        assert_eq!(raw_upload_state(&fixture, id), (0, 0));
+        fixture.hub.end_lease(id, false);
+    }
+
+    #[test]
+    fn resume_checks_expiry_and_aborts_uploads_before_the_runner_polls() {
+        let fixture = Fixture::new(Duration::from_secs(60), test_build());
+        let (_agent, id, mut upload) = stalled_upload_on_a_lease_without_runner(&fixture);
+        fixture.hub.lock().leases.get_mut(&id).unwrap().deadline =
+            Instant::now() - Duration::from_secs(1);
+
+        let (_back, answers) =
+            FakeAgent::rejoin(fixture.port, TOKENS[0], vec![resume_entry(id, 1, 0)]);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].action, ResumeAction::Cancel);
+        assert_eq!(answers[0].reason, Some(CancelReason::LeaseLost));
+        assert!(fixture.hub.lock().leases[&id].lost);
+        // The lease still owns its sender and no runner calls `expired`.
+        // Only the expiry notification in resume can wake this PUT.
+        assert_upload_aborted(&fixture, id, &mut upload, true);
+        fixture.hub.end_lease(id, false);
+    }
+
+    #[test]
+    fn adopting_a_lease_drops_the_replaced_epochs_uploads() {
+        let fixture = Fixture::new(Duration::from_secs(60), test_build());
+        let (_agent, id, mut upload) = stalled_upload_on_a_lease_without_runner(&fixture);
+        let adopted = fixture.hub.adopt(id, 2, None);
+        assert!(fixture.hub.detached(id));
+        assert_eq!(fixture.hub.lock().leases[&id].epoch, 2);
+        assert_upload_aborted(&fixture, id, &mut upload, false);
+        assert_eq!(raw_upload_state(&fixture, id), (0, 0));
+        assert!(adopted.dir.join("blobs").is_dir());
+        fixture.hub.end_lease(id, false);
+    }
+
+    #[test]
     fn rerouting_a_lease_aborts_its_upload_and_the_guard_cleans_up() {
         let fixture = Fixture::new(Duration::from_secs(60), test_build());
         let (_agent, id, mut upload) = stalled_upload_on_a_lease_without_runner(&fixture);
@@ -6672,7 +6721,7 @@ mod tests {
     }
 
     #[test]
-    fn one_agent_across_several_leases_cannot_hold_more_than_its_writer_quota() {
+    fn one_agent_cannot_hold_more_than_its_writer_quota() {
         let fixture = Fixture::build_with(
             tempfile::tempdir().unwrap(),
             Duration::from_secs(60),
@@ -6682,32 +6731,24 @@ mod tests {
             false,
             &|hub| hub.with_agent_upload_writer_limit(2),
         );
-        // One token on two channels at once, each holding a lease: nothing
-        // refuses the second channel, and `claim` hands a lease to any free
-        // one. A different agent holds a third lease.
-        let mut first_channel = fixture.agent(0);
+        let mut agent = fixture.agent(0);
         let first = Uuid::new_v4();
         drop(claim_without_runner(&fixture, first, 1));
-        assert_eq!(first_channel.assigned(), first);
-        let mut second_channel = fixture.agent(0);
-        let second = Uuid::new_v4();
-        drop(claim_without_runner(&fixture, second, 1));
-        assert_eq!(second_channel.assigned(), second);
+        assert_eq!(agent.assigned(), first);
         let mut other_agent = fixture.agent(1);
-        let third = Uuid::new_v4();
-        drop(claim_without_runner(&fixture, third, 1));
-        assert_eq!(other_agent.assigned(), third);
+        let other = Uuid::new_v4();
+        drop(claim_without_runner(&fixture, other, 1));
+        assert_eq!(other_agent.assigned(), other);
 
         let on_first = stalled_artifact_put(fixture.port, TOKENS[0], first, "map");
-        let on_second = stalled_artifact_put(fixture.port, TOKENS[0], second, "map");
+        let on_second = stalled_artifact_put(fixture.port, TOKENS[0], first, "symbols");
         let deadline = Instant::now() + Duration::from_secs(2);
-        while raw_upload_state(&fixture, first) != (1, 1)
-            || raw_upload_state(&fixture, second) != (1, 1)
+        while raw_upload_state(&fixture, first) != (2, 2)
             || fixture.hub.upload_writers.available_permits() != WORKER_MAX_UPLOAD_WRITERS - 2
         {
             assert!(
                 Instant::now() < deadline,
-                "one stalled upload on each of agent 0's leases must hold a writer"
+                "both stalled uploads must hold writers for agent 0"
             );
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -6715,17 +6756,17 @@ mod tests {
         // The first lease is far below its cap of 8 in-flight uploads and
         // the process has writers to spare: only the agent's quota refuses
         // this one.
-        let mut over_quota = stalled_artifact_put(fixture.port, TOKENS[0], first, "symbols");
+        let mut over_quota = stalled_artifact_put(fixture.port, TOKENS[0], first, "names");
         let response = response_text(&mut over_quota);
         assert!(
             response
                 .as_deref()
                 .is_ok_and(|text| status_of(text) == 429 && response_body(text).contains("agent")),
-            "agent 0's third writer across its two leases must be refused with 429: {response:?}"
+            "agent 0's third writer must be refused with 429: {response:?}"
         );
         assert_eq!(
             raw_upload_state(&fixture, first),
-            (1, 1),
+            (2, 2),
             "the refusal releases the reservation it took and writes nothing"
         );
         assert_eq!(fixture.hub.agent_upload_writers.held(0), 2);
@@ -6735,9 +6776,9 @@ mod tests {
         );
 
         // Another agent still gets a writer.
-        let on_third = stalled_artifact_put(fixture.port, TOKENS[1], third, "map");
+        let on_third = stalled_artifact_put(fixture.port, TOKENS[1], other, "map");
         let deadline = Instant::now() + Duration::from_secs(2);
-        while raw_upload_state(&fixture, third) != (1, 1)
+        while raw_upload_state(&fixture, other) != (1, 1)
             || fixture.hub.agent_upload_writers.held(1) != 1
             || fixture.hub.upload_writers.available_permits() != WORKER_MAX_UPLOAD_WRITERS - 3
         {
@@ -6750,7 +6791,7 @@ mod tests {
 
         drop((on_first, on_second, on_third));
         let deadline = Instant::now() + Duration::from_secs(2);
-        while [first, second, third]
+        while [first, other]
             .iter()
             .any(|job| raw_upload_state(&fixture, *job) != (0, 0))
             || fixture.hub.agent_upload_writers.held(0) != 0
@@ -6763,7 +6804,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
-        for job in [first, second, third] {
+        for job in [first, other] {
             fixture.hub.end_lease(job, false);
         }
     }
@@ -9667,6 +9708,72 @@ printf '{"type":"result","v":1,"map_path":"%s/demo.json","symbols_path":"%s/demo
             other => panic!("expected error, got {other:?}"),
         }
         assert!(agent.closed(), "the master must close after an error");
+    }
+
+    #[test]
+    fn a_worker_id_keeps_two_channels_and_one_lease_across_reconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join("worker-tokens");
+        let fixture = Fixture::remote(dir, Duration::from_secs(60), None);
+        let rotated = "rotated-agent-token";
+        write_token_file(
+            &token_file,
+            &[(TOKENS[0], WORKER_IDS[0]), (rotated, WORKER_IDS[0])],
+        );
+        let join = |token: &str, resume| {
+            FakeAgent::rejoin_remote(fixture.port, token, WORKER_IDS[0], resume)
+        };
+        let (mut first, _) = join(TOKENS[0], Vec::new());
+        first.send(&WorkerMessage::Ready { slots_free: 1 });
+        let id = Uuid::new_v4();
+        let _claimed = claim_without_runner(&fixture, id, 1);
+        assert_eq!(first.assigned(), id);
+
+        let (mut second, _) = join(rotated, Vec::new());
+        let next = (1, Uuid::new_v4());
+        let assert_slot_busy = |detached| {
+            let mut inner = fixture.hub.lock();
+            assert_eq!(inner.conns.len(), 2);
+            assert_eq!(inner.leases[&id].conn.is_none(), detached);
+            inner.conns.values_mut().for_each(|conn| conn.ready = true);
+            inner.waiting.insert(next, (false, 0));
+            assert_eq!(pick_agent(&inner, next), None);
+            inner.waiting.remove(&next);
+        };
+        assert_slot_busy(false);
+
+        // Neither old socket has disconnected. A third valid hello still
+        // joins, silently evicts the oldest and leaves its lease resumable.
+        let (mut third, _) = join(rotated, Vec::new());
+        assert_slot_busy(true);
+        let outcome = first.socket.read();
+        assert!(
+            matches!(
+                outcome,
+                Ok(tungstenite::Message::Close(_))
+                    | Err(tungstenite::Error::ConnectionClosed)
+                    | Err(tungstenite::Error::Protocol(
+                        tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+                    ))
+            ) || matches!(&outcome, Err(tungstenite::Error::Io(error))
+                if error.kind() == std::io::ErrorKind::ConnectionReset),
+            "expected eviction without a protocol message, got {outcome:?}"
+        );
+        let (mut back, answers) = join(TOKENS[0], vec![resume_entry(id, 1, 0)]);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].action, ResumeAction::Continue);
+        assert_slot_busy(false);
+        assert!(second.closed());
+
+        // Resuming while the prior holder is still connected replaces
+        // that socket too. The lease remains attached to the newcomer.
+        let (_newest, answers) = join(TOKENS[0], vec![resume_entry(id, 1, 0)]);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].action, ResumeAction::Continue);
+        assert!(third.closed());
+        assert!(back.closed());
+        assert!(!fixture.hub.detached(id));
+        fixture.hub.end_lease(id, false);
     }
 
     /// #156's first departure, lifted (§6 "master restarts mid-job"): a
