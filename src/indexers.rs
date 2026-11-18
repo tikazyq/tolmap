@@ -612,11 +612,10 @@ impl InstallSettings {
 /// and, on failure, the package manager's last lines: never the map.
 ///
 /// Fails safe (owner decision on #117): anything short of a finished
-/// install inside its bounds returns a `fell_back` coverage, having removed
-/// every `node_modules` directory the attempt created, so the indexer runs
-/// on the checkout exactly as with installs off. The package manager only
-/// ever runs inside nsjail; when the jail cannot be set up or its
-/// self-test fails, nothing runs at all.
+/// install inside its bounds returns a `fell_back` coverage. Cleanup removes
+/// newly created `node_modules` directories that still match the checkout
+/// entries it collected. The package manager only ever runs inside nsjail;
+/// when the jail cannot be set up or its self-test fails, nothing runs at all.
 pub fn install(
     repo: &Path,
     scratch: &Path,
@@ -1369,19 +1368,226 @@ direct.on('error', () => askProxy());
         found
     }
 
-    /// Removes every `node_modules` the install created, so a fallback
-    /// indexes exactly the checkout it would have without installs (a
-    /// partial `node_modules` would give scip-typescript half a dependency
-    /// graph). `remove_dir_all` does not follow symlinks.
+    /// Removes newly installed `node_modules`. A partial install would
+    /// give scip-typescript half a dependency graph on fallback.
     pub(super) fn remove_new_node_modules(
         repo: &Path,
         before: &std::collections::BTreeSet<PathBuf>,
     ) -> usize {
-        node_modules_dirs(repo)
-            .into_iter()
-            .filter(|path| !before.contains(path))
-            .filter(|path| fs::remove_dir_all(path).is_ok())
-            .count()
+        #[cfg(target_os = "linux")]
+        {
+            cleanup::remove(repo, before, &|_| {})
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            node_modules_dirs(repo)
+                .into_iter()
+                .filter(|path| !before.contains(path))
+                .filter(|path| fs::remove_dir_all(path).is_ok())
+                .count()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) mod cleanup {
+        use std::collections::BTreeSet;
+        use std::ffi::{CStr, CString, OsStr, OsString};
+        use std::fs::{self, File, OpenOptions};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::path::{Path, PathBuf};
+
+        type Identity = (u64, u64);
+
+        fn identity(directory: &File) -> Option<Identity> {
+            let meta = directory.metadata().ok()?;
+            Some((meta.dev(), meta.ino()))
+        }
+
+        fn open_root(repo: &Path) -> Option<File> {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(repo)
+                .ok()
+        }
+
+        // `name` is either one directory entry or `..`; no intermediate
+        // path components can be resolved by openat.
+        fn open_dir(parent: &File, name: &CStr) -> Option<File> {
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return None;
+            }
+            Some(unsafe { File::from_raw_fd(fd) })
+        }
+
+        fn matches_entry(parent: &File, name: &CStr, expected: Identity) -> bool {
+            open_dir(parent, name).and_then(|directory| identity(&directory)) == Some(expected)
+        }
+
+        fn unlink(parent: &File, name: &CStr, flags: libc::c_int) -> bool {
+            (unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) }) == 0
+        }
+
+        struct Frame {
+            name: OsString,
+            id: Identity,
+            entries: std::vec::IntoIter<(OsString, bool)>,
+            removing: bool,
+        }
+
+        impl Frame {
+            fn new(directory: &File, name: OsString, id: Identity, removing: bool) -> Self {
+                // This procfs entry refers to the open directory even if a
+                // checkout path has moved. Drop the reader before descending.
+                let mut entries = fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|entry| Some((entry.file_name(), entry.file_type().ok()?.is_dir())))
+                    .collect::<Vec<_>>();
+                entries.sort_unstable();
+                Self {
+                    name,
+                    id,
+                    entries: entries.into_iter(),
+                    removing,
+                }
+            }
+        }
+
+        fn entry_name(name: &OsStr) -> CString {
+            // The kernel supplies these names, so they cannot contain NULs.
+            CString::new(name.as_bytes()).expect("directory entry without NUL")
+        }
+
+        fn linked_to_root(repo: &Path, frames: &[Frame], directory: &File) -> Option<()> {
+            let mut directory = directory.try_clone().ok()?;
+            for (child, parent) in frames.iter().skip(1).zip(frames).rev() {
+                let up = open_dir(&directory, c"..")?;
+                if identity(&up) != Some(parent.id)
+                    || !matches_entry(&up, &entry_name(&child.name), child.id)
+                {
+                    return None;
+                }
+                directory = up;
+            }
+            // The caller's checkout path may have intermediate symlinks.
+            // Reopening it here checks the root's identity only.
+            (identity(&open_root(repo)?) == Some(frames[0].id)).then_some(())
+        }
+
+        fn remove_empty_dir(parent: &File, name: &CStr, expected: Identity) -> bool {
+            // Linux has no rmdir-by-fd. If an empty replacement wins the
+            // final race between these calls, unlinkat could remove it, but
+            // it cannot traverse a replacement or remove any of its contents.
+            matches_entry(parent, name, expected) && unlink(parent, name, libc::AT_REMOVEDIR)
+        }
+
+        struct Candidate {
+            parent: File,
+            _directory: File, // Pin the inode even while walking its children.
+        }
+
+        pub(in super::super) fn remove(
+            repo: &Path,
+            before: &BTreeSet<PathBuf>,
+            collected: &dyn Fn(&Path),
+        ) -> usize {
+            let Some(mut directory) = open_root(repo) else {
+                return 0;
+            };
+            let Some(root_id) = identity(&directory) else {
+                return 0;
+            };
+            let mut path = repo.to_path_buf();
+            let mut frames = vec![Frame::new(&directory, OsString::new(), root_id, false)];
+            let mut removed = 0;
+            let mut active: Option<Candidate> = None;
+            // The stack holds names and identities, so depth does not cost
+            // descriptors. Only the current directory and the active
+            // candidate's original handles stay open between steps.
+            while let Some(frame) = frames.last_mut() {
+                let Some((name, is_dir)) = frame.entries.next() else {
+                    let finished = frames.pop().expect("current directory frame");
+                    let Some(parent) = frames.last() else { break };
+                    let name = entry_name(&finished.name);
+                    if finished.removing && !parent.removing {
+                        let candidate = active.take().expect("active node_modules candidate");
+                        if linked_to_root(repo, &frames, &candidate.parent).is_some()
+                            && remove_empty_dir(&candidate.parent, &name, finished.id)
+                        {
+                            removed += 1;
+                        }
+                        directory = candidate.parent;
+                    } else {
+                        let Some(up) = open_dir(&directory, c"..") else {
+                            break;
+                        };
+                        if identity(&up) != Some(parent.id) {
+                            break;
+                        }
+                        if finished.removing {
+                            remove_empty_dir(&up, &name, finished.id);
+                        }
+                        directory = up;
+                    }
+                    path.pop();
+                    continue;
+                };
+                let removing = frame.removing;
+                let name_c = entry_name(&name);
+                if !is_dir {
+                    if removing {
+                        unlink(&directory, &name_c, 0);
+                    }
+                    continue;
+                }
+                if frames.len() == 1 && name == ".git" {
+                    continue;
+                }
+                let candidate = !removing && name == "node_modules";
+                if candidate && before.contains(&path.join(&name)) {
+                    continue;
+                }
+                let Some(child) = open_dir(&directory, &name_c) else {
+                    continue;
+                };
+                let Some(child_id) = identity(&child) else {
+                    continue;
+                };
+                path.push(&name);
+                if candidate {
+                    // Let tests replace the name while both handles are live.
+                    collected(&path);
+                    if linked_to_root(repo, &frames, &directory).is_none()
+                        || !matches_entry(&directory, &name_c, child_id)
+                    {
+                        path.pop();
+                        continue;
+                    }
+                    let Ok(pinned) = child.try_clone() else {
+                        path.pop();
+                        continue;
+                    };
+                    active = Some(Candidate {
+                        parent: directory,
+                        _directory: pinned,
+                    });
+                }
+                frames.push(Frame::new(&child, name, child_id, removing || candidate));
+                directory = child;
+            }
+            removed
+        }
     }
 
     /// Package-manager output is the repository's text: control characters
@@ -2307,19 +2513,110 @@ mod tests {
     #[test]
     fn a_fallback_removes_only_the_node_modules_the_install_created() {
         let directory = tempfile::tempdir().unwrap();
-        let repo = directory.path();
-        write(repo, "vendor/node_modules/kept/index.js", "");
-        write(repo, ".git/node_modules/untouched", "");
-        let before = jail::node_modules_dirs(repo);
+        let repo = directory.path().join("repo");
+        let outside = directory.path().join("outside");
+        write(&outside, "node_modules/untouched", "");
+        write(&repo, "vendor/node_modules/kept/index.js", "");
+        write(&repo, ".git/node_modules/untouched", "");
+        let before = jail::node_modules_dirs(&repo);
         assert_eq!(before.len(), 1);
-        write(repo, "node_modules/.pnpm/x/index.js", "");
-        write(repo, "packages/a/node_modules/y/index.js", "");
-        std::os::unix::fs::symlink("/", repo.join("packages/link")).unwrap();
-        assert_eq!(jail::remove_new_node_modules(repo, &before), 2);
+        write(&repo, "node_modules/.pnpm/x/index.js", "");
+        write(&repo, "packages/a/node_modules/y/index.js", "");
+        std::os::unix::fs::symlink(&outside, repo.join("packages/link")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("node_modules/link")).unwrap();
+        assert_eq!(jail::remove_new_node_modules(&repo, &before), 2);
+        assert!(outside.join("node_modules/untouched").is_file());
         assert!(repo.join("vendor/node_modules/kept/index.js").exists());
         assert!(repo.join(".git/node_modules/untouched").exists());
         assert!(!repo.join("node_modules").exists());
         assert!(!repo.join("packages/a/node_modules").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_skips_a_node_modules_replaced_after_collection() {
+        use std::os::unix::fs::symlink;
+
+        for replace_with_symlink in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = directory.path().join("repo");
+            let target = repo.join("node_modules");
+            let original = directory.path().join("original");
+            let outside = directory.path().join("outside");
+            write(&target, "original.js", "");
+            write(&outside, "keep.js", "");
+            let before = std::collections::BTreeSet::new();
+
+            let removed = jail::cleanup::remove(&repo, &before, &|collected| {
+                assert_eq!(collected, target);
+                fs::rename(collected, &original).unwrap();
+                if replace_with_symlink {
+                    symlink(&outside, collected).unwrap();
+                } else {
+                    fs::create_dir(collected).unwrap();
+                }
+            });
+
+            assert_eq!(removed, 0);
+            assert!(original.join("original.js").is_file());
+            assert!(outside.join("keep.js").is_file());
+            let replacement = fs::symlink_metadata(&target).unwrap();
+            assert_eq!(replacement.is_symlink(), replace_with_symlink);
+            assert_eq!(replacement.is_dir(), !replace_with_symlink);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_skips_node_modules_below_a_replaced_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        for replace_with_symlink in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = directory.path().join("repo");
+            let ancestor = repo.join("packages");
+            let original = directory.path().join("original");
+            let outside = directory.path().join("outside");
+            let relative = "project/node_modules";
+            write(&ancestor.join(relative), "original.js", "");
+            write(&outside.join(relative), "keep.js", "");
+            let before = std::collections::BTreeSet::new();
+
+            let removed = jail::cleanup::remove(&repo, &before, &|collected| {
+                assert_eq!(collected, ancestor.join(relative));
+                fs::rename(&ancestor, &original).unwrap();
+                if replace_with_symlink {
+                    symlink(&outside, &ancestor).unwrap();
+                } else {
+                    fs::rename(&outside, &ancestor).unwrap();
+                }
+            });
+
+            assert_eq!(removed, 0);
+            assert!(original.join(relative).join("original.js").is_file());
+            assert!(ancestor.join(relative).join("keep.js").is_file());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_removes_deep_node_modules_through_a_symlinked_checkout_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let repo = alias.join("repo");
+        let parent = repo.join("a/".repeat(600));
+        let target = parent.join("node_modules");
+        write(&target.join("b/".repeat(600)), "dependency.js", "");
+
+        assert_eq!(
+            jail::remove_new_node_modules(&repo, &std::collections::BTreeSet::new()),
+            1
+        );
+        assert!(parent.is_dir());
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]
