@@ -246,8 +246,31 @@ tolmap rm engine
 XDG/HOME defaults choose the shared root. Local identity is canonical checkout
 root; identical origins never merge checkouts. Basename collisions receive a
 path hash suffix. GitHub URL/name spellings deduplicate case-insensitively.
-Remote acquisition is anonymous with helpers/prompts disabled; private GitHub
-support is a later slice. Failed adds remain registered and appear in `repos`.
+GitHub HEAD lookup, clone and fetch first try anonymously with credential
+helpers and prompts disabled. Only authentication or repository-not-found
+refusals retry with your existing credentials. Configure a Git credential helper
+or run `gh auth login` with access to the repository; the web process uses the
+credentials and helper session of the user who launched it. `GH_TOKEN`,
+`GITHUB_TOKEN` and `GH_HOST` are also available to the gh provider. Other network
+failures do not trigger credential lookup. Failed adds remain registered and
+appear in `repos`.
+
+The authenticated retry uses the hidden `tolmap personal-github-credential`
+bridge. It asks `git credential fill` first, then `gh auth git-credential get`
+only when Git supplies no credential. Each provider has a 15-second deadline.
+Prompts remain disabled; helper `store` and `erase` operations are ignored.
+Credentials pass only through helper stdin/stdout and are never saved in tolmap
+configuration, clone URLs, logs, jobs or SQLite. Provider diagnostics are
+replaced with fixed errors. Missing or revoked credentials leave the previous
+complete snapshot available.
+
+Clones contain full history and objects, and refresh fetches into an explicit
+remote ref. Maps and independent source snapshots remain on disk until repository
+removal, even if access is later revoked. Revoking credentials does not erase
+retained private data. `tolmap web` has no authentication: binding off loopback
+exposes private source, maps and repository management to anyone who can reach
+that listener, including the ability to request repositories accessible through
+the launching user's credentials.
 
 A moved checkout can be relinked with `add NEW_PATH --name EXISTING` only when
 the old path is missing and the new checkout contains its last indexed commit.

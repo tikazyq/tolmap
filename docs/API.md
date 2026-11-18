@@ -89,7 +89,35 @@ bundle (the default is `web/dist` relative to the launch directory). A missing
 bundle is a startup error. Web reuses the service's API-safe SPA/static handler
 and the existing React host composition; public admission/catalogue handlers
 are not mounted. `serve` and `local` remain separate until the retirement slice.
-No old stores are discovered or imported. Private GitHub acquisition is deferred.
+No old stores are discovered or imported.
+
+Personal GitHub HEAD lookup, clone and fetch try anonymously first with helpers
+and prompts disabled. Only authentication or not-found refusals retry with the
+launching user's existing credentials. The retry installs a hidden
+`tolmap personal-github-credential <operation>` helper, which asks
+`git credential fill`, then `gh auth git-credential get` only if Git supplies no
+credential. Each provider is limited to 15 seconds, including when descendants
+keep its stdout open; timed-out provider groups are killed and direct children
+reaped. `store` and `erase` do nothing. All prompts stay disabled.
+
+Authenticated Git and the bridge receive the user's helper session environment
+and `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`. The Git-helper provider receives the
+helper session but no gh variables; the gh provider receives both. Provider PATH
+entries must be absolute; empty and relative entries are removed. Anonymous Git
+retains its cleared environment. Configure access using the user's existing Git
+credential helper or `gh auth login`, not application configuration or API bodies.
+Credentials travel through helper stdin/stdout only, never clone URLs, arguments,
+files, configuration, persisted jobs, logs or database rows. Provider diagnostics
+are discarded before storage; unavailable or revoked credentials return a fixed
+setup/access error. Other transport failures do not retry with credentials.
+
+Acquisition uses full clones without lazy object fetching; fetch writes an
+explicit remote ref that refresh resolves instead of `FETCH_HEAD`. A failed
+refresh preserves the last complete snapshot. Private source and maps are
+retained until repository removal, including after credentials are revoked.
+Binding off loopback exposes that retained private content and repository
+management without authentication. Anyone who can reach the listener can also
+request repositories accessible through the launching user's credentials.
 
 | Method and route | Personal behavior |
 | --- | --- |
@@ -98,7 +126,7 @@ No old stores are discovered or imported. Private GitHub acquisition is deferred
 | `POST /api/repositories/{id}/refresh` | Refresh committed HEAD through the same library as CLI; returns `202` with `job_id`. |
 | `DELETE /api/repositories/{id}` | Remove registration and tolmap-owned history/source; preserve the original checkout. Busy repositories must finish/cancel first. |
 | `GET /api/personal/scan?path=...` | Sorted checkout roots without following symlinks or entering discovered checkouts, using `OfferedRepository` rows and registered markers. Local rows do not display provider visibility. |
-| `POST /api/personal/index` | Existing `BatchIndexRequest` (`provider_ids` are local paths or anonymous GitHub source strings); returns `BatchIndexResponse`. Sources register before jobs start. |
+| `POST /api/personal/index` | Existing `BatchIndexRequest` (`provider_ids` are local paths or GitHub source strings; access uses the launching user's credentials when needed); returns `BatchIndexResponse`. Sources register before jobs start. |
 | `GET /api/personal/batches/{id}` | Persisted `BatchProgress`; reloadable batch URL `/new/batches/{id}`. |
 | `GET /api/jobs/{id}` | Re-read durable `JobSnapshot`, including worker phase/progress and terminal errors. |
 | `POST /api/jobs/{id}/cancel` | Cancel queued work or stop its isolated indexer; completed maps remain available. |

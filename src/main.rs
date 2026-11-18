@@ -25,8 +25,10 @@ enum DebtCommand {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Register and index committed local or public GitHub source.
+    /// Register and index committed local or GitHub source.
     Add(tolmap::personal::AddArgs),
+    #[command(hide = true)]
+    PersonalGithubCredential { operation: String },
     /// List registrations and last observed freshness; never index or fetch.
     Repos,
     /// Browse and manage the shared personal repository library.
@@ -723,6 +725,9 @@ fn main() -> Result<()> {
                 Ok(snapshot.deps(&args.path, args.direction, args.options.limit.unwrap_or(25)))
             },
         )),
+        Command::PersonalGithubCredential { operation } => {
+            tolmap::personal::github::helper(&operation)
+        }
         Command::Add(args) => tolmap::personal::run_add(args, data),
         Command::Repos => {
             let library = tolmap::personal::Library::open(data)?;
