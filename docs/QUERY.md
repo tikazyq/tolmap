@@ -37,7 +37,13 @@ using `/`; they are not filesystem paths relative to the current directory.
 is a candidate; `query.ambiguous` is true when there is more than one, even if
 the limit hides all but one. Use a returned qualified name (and inspect line
 ranges if that still names several definitions). No candidate is selected for
-the caller.
+the caller. If neither files nor symbols match a path-shaped target (contains
+`/` or has a filename extension), `query.missing_path` is true and text says
+that no mapped file matches. `query.suggestions` lists up to three nearest
+mapped paths by Unicode Levenshtein edit distance, then full path lexical order
+for ties. Suggestions are advisory, separate from results and independent of
+`--limit`; `total` stays 0. Successful file/symbol lookups and plain symbol
+misses set `missing_path: false` and `suggestions: []`.
 
 Only a symbol lookup reads the map's `<stem>.symbols.json` sibling, when present.
 A registered personal snapshot uses its retained
@@ -91,7 +97,7 @@ one trailing newline. Paths and district names replace all internal indices.
 
 ## Query and result shapes
 
-- **where**: `query` has `target` and `ambiguous`. Rows are
+- **where**: `query` has `target`, `ambiguous`, `missing_path` and `suggestions` (see matching rules above). Rows are
   `{"kind":"file","path":...,"district":...,"symbol":null}` for files;
   symbol candidates set `symbol` to
   `{"name":...,"qualified_name":...,"start":...,"end":...}`.
@@ -106,7 +112,16 @@ one trailing newline. Paths and district names replace all internal indices.
   `{"kind":"dependency","path":...,"district":...,"direction":"in|out"}`,
   sorted by path then direction (`in` first).
 - **overview**: `query` includes `files`, `imports` (map edge rows), `districts`,
-  and `language` (the map's language label). Rows are
+  and `language` (the map's language label). `excluded_test_files` reports distinct
+  source paths omitted by test filters within selected source roots; `null`
+  means unmeasured (older maps/graph dumps), never zero. Text prints the count
+  or `unknown (older map)`. `test_exclusion_rule` states the filters: Python
+  skips `test/` and `tests/`; Go, Rust and TypeScript also skip `__tests__/`;
+  Go skips `*_test.go`; TypeScript skips `.test.`/`.spec.` source filenames.
+  Other source exclusions still apply, including declaration files and vendor
+  directories. Inline tests and Rust `*_tests.rs` files remain included.
+  Counts are captured during build, never inferred from a query's checkout.
+  Rows are
   `{"kind":"district","name":...,"files":N,"imports_in":N,"imports_out":N}`.
   Counts describe cross-district imports only; internal imports are excluded.
   Rows sort by descending file count, then name, with stored district order

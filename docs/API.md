@@ -2,6 +2,27 @@
 
 `tolmap web` is the only HTTP entry point. CLI examples and resolution rules are in [QUERY.md](QUERY.md); setup is in [LOCAL.md](LOCAL.md).
 
+Compact CLI contracts are documented in [QUERY.md](QUERY.md) and
+[CHECK.md](CHECK.md). Their additive fields keep the existing versions:
+
+- `where` adds `query.missing_path` and `query.suggestions` for unmatched
+  path-shaped targets. Symbols still take precedence over missing-path advice;
+  suggestions sort by edit distance, then path, and do not count as results.
+- `overview` adds `query.excluded_test_files` and `query.test_exclusion_rule`.
+  Map JSON stores optional `excluded_test_files`, measured at build time across
+  the selected sources with duplicate paths counted once. Absence means unknown;
+  compact overview returns `null` and text reports an unknown older-map count.
+  Python excludes `test/` and `tests/`; Go/Rust/TypeScript also exclude
+  `__tests__/`; Go excludes `*_test.go`; TypeScript excludes `.test.`/`.spec.`
+  source filenames. Other source filters still apply; inline tests and Rust
+  `*_tests.rs` are included.
+- Advisory checks add `default_thresholds` with `verdict`, the two default
+  limits and signed `districts_margin`/`dq_margin`. Negative margins exceed a
+  limit; zero meets it. `--report-only` still returns `verdict: pass` and exit 0.
+  Registered local checks select a caller's linked worktree by Git common
+  directory. Remote registrations require `--head` and retained source, or an
+  explicit checkout with `--base` and optionally `--base-map`.
+
 ## Personal shared store and application configuration
 
 The CLI and browser share `service::store::Store`: a repository registry, durable attempts and UUID snapshots. History is retained until removal or an explicit retention setting. Existing data is never discovered or imported; re-add repositories to start new history. Files outside the selected personal root are left alone.

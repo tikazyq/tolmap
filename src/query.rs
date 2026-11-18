@@ -56,6 +56,23 @@ pub struct RouteArgs {
     pub options: QueryOptions,
 }
 
+// Levenshtein distance over Unicode characters; equal distances sort by full path.
+fn path_distance(query: &str, path: &str) -> usize {
+    let path: Vec<_> = path.chars().collect();
+    let mut previous: Vec<_> = (0..=path.len()).collect();
+    let mut current = vec![0; path.len() + 1];
+    for (i, a) in query.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, b) in path.iter().enumerate() {
+            current[j + 1] = (current[j] + 1)
+                .min(previous[j + 1] + 1)
+                .min(previous[j] + usize::from(a != *b));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[path.len()]
+}
+
 pub struct Snapshot {
     pub map: MapDocument,
     pub identity: MapIdentity,
@@ -187,6 +204,8 @@ impl Snapshot {
                 Query::Where {
                     target: target.into(),
                     ambiguous: false,
+                    missing_path: false,
+                    suggestions: Vec::new(),
                 },
                 limit,
                 vec![QueryResult::File {
@@ -284,6 +303,24 @@ impl Snapshot {
                 .then(x.end.cmp(&y.end))
         });
         let ambiguous = hits.len() > 1;
+        let missing_path =
+            hits.is_empty() && (target.contains('/') || Path::new(target).extension().is_some());
+        let suggestions = if missing_path {
+            let mut nearest: Vec<_> = self
+                .map
+                .files
+                .iter()
+                .map(|path| (path_distance(target, path), path))
+                .collect();
+            nearest.sort();
+            nearest
+                .into_iter()
+                .take(3)
+                .map(|(_, path)| path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let results = hits
             .into_iter()
             .map(|(file, symbol)| QueryResult::File {
@@ -296,6 +333,8 @@ impl Snapshot {
             Query::Where {
                 target: target.into(),
                 ambiguous,
+                missing_path,
+                suggestions,
             },
             limit,
             results,
@@ -339,6 +378,8 @@ impl Snapshot {
                 imports: self.map.edges.len(),
                 districts: self.map.districts.len(),
                 language: self.map.lang.clone(),
+                excluded_test_files: self.map.excluded_test_files,
+                test_exclusion_rule: crate::extract::TEST_EXCLUSION_RULE.into(),
             },
             limit,
             results,
@@ -555,9 +596,32 @@ pub fn text(report: &QueryResponse) -> String {
             imports,
             districts,
             language,
-        } => out.push_str(&format!(
-            "{files} files, {imports} imports, {districts} districts, language {language}\n"
-        )),
+            excluded_test_files,
+            test_exclusion_rule,
+        } => {
+            out.push_str(&format!(
+                "{files} files, {imports} imports, {districts} districts, language {language}\n"
+            ));
+            let count =
+                excluded_test_files.map_or_else(|| "unknown (older map)".into(), |n| n.to_string());
+            out.push_str(&format!(
+                "excluded test files: {count}; rule: {test_exclusion_rule}\n"
+            ));
+        }
+        Query::Where {
+            target,
+            missing_path: true,
+            suggestions,
+            ..
+        } => {
+            out.push_str(&format!("no mapped file matches {target:?}\n"));
+            if !suggestions.is_empty() {
+                out.push_str(&format!(
+                    "nearest mapped paths: {}\n",
+                    suggestions.join(", ")
+                ));
+            }
+        }
         Query::Route { edge_kind, .. } => out.push_str(&format!(
             "file import path ({edge_kind:?}); not a runtime call chain\n"
         )),

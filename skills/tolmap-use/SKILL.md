@@ -65,6 +65,15 @@ tolmap where 'src/bin/generate_types.rs::main' --map "$MAP"
 tolmap route src/main.rs src/schema.rs --map "$MAP"
 ```
 
+`overview` reports `query.excluded_test_files` and `query.test_exclusion_rule`:
+its file count omits test directories (Python `test/`/`tests/`, also `__tests__/`
+for Go/Rust/TypeScript), Go `*_test.go`, and TypeScript `.test.`/`.spec.` files.
+Other source filters still apply; inline tests and Rust `*_tests.rs` stay in.
+A null excluded count means unmeasured in an older map, not zero. For a path
+miss, `where` sets `query.missing_path` and offers up to three nearest mapped
+paths in `query.suggestions` (edit distance, lexical path ties); `total` stays
+0. A matching symbol still returns normally.
+
 `overview` lists districts, not entry landmarks; use manifests/source to discover
 entry paths. Paths are exact repository-relative paths, with `/`. JSON is the default;
 `--format text` is for people. `deps` is direct adjacency, not transitive impact.
@@ -99,6 +108,14 @@ Read changed files, districts, edges, `lower_bound` and `outside_graph` together
 an empty mapped impact does not make those changes safe or irrelevant.
 `--all-sources` uses detection's scope floor; explicit paired `--pkg`/`--lang`
 can select sources when needed. Keep pilot checks advisory (`--report-only`).
+Read `default_thresholds.verdict` and its signed `districts_margin`/`dq_margin`
+to see whether the defaults (4 districts, 0.0001 modularity drop) would pass;
+negative margins exceed a limit. This advice keeps the exit status at 0.
+From a linked worktree, a local registration uses that worktree's HEAD and dirty
+files. A remote `--repo owner/name` requires `--head REF` and retained source;
+to compare the local worktree instead, use `check . --base REF --base-map FILE`.
+Missing snapshot errors identify `--data`, `--commit`/`--snapshot` or explicit
+checkout flags needed to recover.
 Exit 0 means a valid advisory report, not absence of risk; 2/3 mean input/internal
 failure. Compact queries also return 0 for no match, so read `total`.
 

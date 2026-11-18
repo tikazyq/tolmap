@@ -838,6 +838,8 @@ fn compare(
         edges_added,
         edges_removed,
         landmark_touches,
+        default_thresholds: (thresholds.source == CheckThresholdSource::ReportOnly)
+            .then(|| default_thresholds(districts_crossed, delta_q)),
         thresholds,
         verdict: if failed {
             CheckVerdict::Fail
@@ -971,6 +973,13 @@ pub fn render_text(report: &CheckReport) -> String {
         report.delta_q, report.modularity_base, report.modularity_head
     );
     let _ = writeln!(out, "verdict: {}", verdict_line(report));
+    if let Some(defaults) = &report.default_thresholds {
+        let verdict = match defaults.verdict {
+            CheckVerdict::Pass => "pass",
+            CheckVerdict::Fail => "fail",
+        };
+        let _ = writeln!(out, "default thresholds would {verdict}: --max-districts {}, --max-dq {:.6}; margins districts {:+}, delta q {:+.6} (negative exceeds limit; advisory only)", defaults.max_districts, defaults.max_dq, defaults.districts_margin, defaults.dq_margin);
+    }
 
     let _ = writeln!(
         out,
@@ -1050,6 +1059,20 @@ pub fn render_text(report: &CheckReport) -> String {
     }
     let _ = writeln!(out, "{LOWER_BOUND_NOTE}");
     out
+}
+
+fn default_thresholds(districts: usize, delta_q: f64) -> crate::schema::CheckDefaultThresholds {
+    crate::schema::CheckDefaultThresholds {
+        verdict: if districts > DEFAULT_MAX_DISTRICTS || delta_q < -DEFAULT_MAX_DQ {
+            CheckVerdict::Fail
+        } else {
+            CheckVerdict::Pass
+        },
+        max_districts: DEFAULT_MAX_DISTRICTS,
+        max_dq: DEFAULT_MAX_DQ,
+        districts_margin: DEFAULT_MAX_DISTRICTS as i64 - districts as i64,
+        dq_margin: round(delta_q + DEFAULT_MAX_DQ),
+    }
 }
 
 fn verdict_line(report: &CheckReport) -> String {
@@ -1720,6 +1743,22 @@ mod tests {
             max_districts,
             max_dq,
             report_only,
+        }
+    }
+
+    #[test]
+    fn advisory_defaults_report_signed_margins_and_inclusive_boundaries() {
+        for (districts, dq, verdict, district_margin, dq_margin) in [
+            (4, -0.0001, CheckVerdict::Pass, 0, 0.0),
+            (2, 0.0002, CheckVerdict::Pass, 2, 0.0003),
+            (5, -0.000101, CheckVerdict::Fail, -1, -0.000001),
+            (5, 0.0, CheckVerdict::Fail, -1, 0.0001),
+            (1, -0.0002, CheckVerdict::Fail, 3, -0.0001),
+        ] {
+            let report = default_thresholds(districts, dq);
+            assert_eq!(report.verdict, verdict);
+            assert_eq!(report.districts_margin, district_margin);
+            assert_eq!(report.dq_margin, dq_margin);
         }
     }
 

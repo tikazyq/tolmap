@@ -28,7 +28,7 @@ tolmap check <repo> --base <ref> [--head <ref>] [--base-map <map.json>]
 **With no threshold flag the check applies `--max-districts 4 --max-dq 0.0001`.** Both are absolute: neither scales with the size of the repository.
 
 - **Flags replace the defaults as a set.** Pass either threshold flag and only the flags you pass apply. `--max-dq 0.002` alone checks Δq and nothing else; no default mixes in.
-- **`--report-only` applies none.** That is the behaviour the check had before the defaults existed.
+- **`--report-only` applies none.** Exit status stays 0 and `verdict` stays `pass`. The extra `default_thresholds` object and text line say whether the defaults **would** pass or fail, with signed margins: `districts_margin = 4 - districts_crossed`, `dq_margin = delta_q + 0.0001` (rounded to six places). Zero meets the limit; a negative margin exceeds it. This is advisory and does not apply a gate.
 - **The report says which applied.** `thresholds.source` is `default`, `flags` or `report_only`.
 
 The defaults come from replaying 600 real commits through the check on GitHub Actions: the last 200 first-parent commits of django, prometheus and vuejs/core at their corpus pins (`remote-build.yml` `command=check-calibrate`). `--max-districts` is from docs/FINDINGS.md finding 60. `--max-dq` was recalibrated in finding 61, after co-change was held at the base (see "Co-change is the base's on both sides" below). On those commits the two together fail 10, 2 and 7 of the 200 (5%, 1% and 3.5%).
@@ -121,11 +121,12 @@ Any other name exits 2 rather than trusting an unverified map. A map from the se
 | `landmark_touches` | `{file, kind, detail}[]` | `kind` is `hazard` or `bridge` |
 | `thresholds` | `{max_districts, max_dq, source}` | the thresholds applied, `null` where one was not applied. `source` is `default` (no threshold flag), `flags` (the flags given, and only those) or `report_only` (both `null`) |
 | `verdict` | `"pass" \| "fail"` | `fail` exactly when the exit code is 1 |
+| `default_thresholds` | `{verdict, max_districts, max_dq, districts_margin, dq_margin}` | Present for `--report-only`: advisory verdict against 4 districts and 0.0001 modularity drop. Margins are signed remaining allowance; negative means fail. Absent on other runs and in older reports |
 | `lower_bound` | `true` | always |
 
 ## Text format
 
-The text format starts with three lines: districts crossed, Δq and the verdict. Then comes the edge list: added (`+`) and removed (`−`) cross-district edges merged, heaviest first, with at most 20 shown. Then come context lines for unplaced files and touched landmarks, and last the lower-bound note. JSON lists every edge.
+The text format starts with three lines: districts crossed, Δq and the verdict. Report-only checks add one line with the default verdict and signed margins. Then comes the edge list: added (`+`) and removed (`−`) cross-district edges merged, heaviest first, with at most 20 shown. Then come context lines for unplaced files and touched landmarks, and last the lower-bound note. JSON lists every edge.
 
 ## Polyglot scope example
 
@@ -386,7 +387,16 @@ tolmap check --repo engine --commit <retained-base-sha> --head <available-head-s
 
 `--commit` selects the stored base snapshot; `--base`, when supplied, must agree.
 Without `--head`, local registrations compare the working tree including dirty
-files. Remote registrations require explicit retained source and `--head`.
+files. From a linked Git worktree sharing the registered checkout's Git common
+directory, check uses the caller's worktree (including its HEAD and dirty files).
+Remote registrations require retained source and `--head`, even when the caller
+is in a local worktree: remote names do not establish local checkout identity.
+For that case use `tolmap check . --base REF --base-map FILE --report-only`,
+where FILE is the selected snapshot's `map_path`, or pass `--head REF` to use
+retained source. Missing snapshots, map files, source directories and revisions
+produce input errors naming the missing input and recovery flags. Select the
+same `--data ROOT` used for indexing and a retained `--commit SHA` or
+`--snapshot ID` when needed.
 Explicit path and `--base-map` inputs remain available. Thresholds and exit
 meanings are unchanged. Comparison HTTP endpoints are retired; protected
 embedders can still call the comparison library with their opt-in access policy.

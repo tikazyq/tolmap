@@ -926,6 +926,7 @@ fn compact(
         uses,
         roads: geometry.roads,
         lang: layout.weighted.lang,
+        excluded_test_files: layout.weighted.excluded_test_files,
         coverage: Some(coverage),
         parcels: None,
         footprint_centroids: None,

@@ -413,6 +413,22 @@ fn the_default_thresholds_fail_a_heavy_coupling_change_without_any_flag() {
         run.stdout.lines().nth(2).unwrap(),
         "verdict: pass (report only: --report-only)"
     );
+    assert!(
+        run.stdout.contains("default thresholds would fail:"),
+        "{}",
+        run.stdout
+    );
+    let advisory = check(
+        &repo,
+        &["--base", &base, "--report-only", "--format", "json"],
+    );
+    expect_code(&advisory, 0);
+    let report = advisory.json();
+    assert_eq!(report["verdict"], "pass");
+    assert_eq!(report["default_thresholds"]["verdict"], "fail");
+    assert_eq!(report["default_thresholds"]["max_districts"], 4);
+    assert_eq!(report["default_thresholds"]["max_dq"], 0.0001);
+    assert!(report["default_thresholds"]["dq_margin"].as_f64().unwrap() < 0.0);
     // A flag the change stays inside replaces both defaults: pass.
     let run = check(&repo, &["--base", &base, "--max-dq", "1"]);
     expect_code(&run, 0);

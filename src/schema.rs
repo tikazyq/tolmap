@@ -372,6 +372,9 @@ pub struct MapDocument {
     pub uses: BTreeMap<String, Vec<usize>>,
     pub roads: Vec<RoadRow>,
     pub lang: String,
+    // Source files omitted by the test filters; absent in older maps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_test_files: Option<usize>,
     // Kept-edge coverage; absent in maps built before issue #40.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<CoverageReport>,
@@ -519,7 +522,19 @@ pub struct CheckReport {
     pub landmark_touches: Vec<CheckLandmark>,
     pub thresholds: CheckThresholds,
     pub verdict: CheckVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thresholds: Option<CheckDefaultThresholds>,
     pub lower_bound: bool,
+}
+
+/// Advisory comparison with the defaults; positive margins pass, negative margins fail.
+#[derive(Clone, Debug, Serialize, Deserialize, TS, PartialEq)]
+pub struct CheckDefaultThresholds {
+    pub verdict: CheckVerdict,
+    pub max_districts: usize,
+    pub max_dq: f64,
+    pub districts_margin: i64,
+    pub dq_margin: f64,
 }
 
 // A changed file absent from both graphs. `not_in_scope` includes files
@@ -698,6 +713,8 @@ pub struct GraphData {
     pub lang: String,
     /// Entry evidence keyed by mapped file path; never used for partitioning.
     pub entry_points: BTreeMap<String, String>,
+    /// Metadata only; None for legacy dumps or extraction from a fixed file list.
+    pub excluded_test_files: Option<usize>,
     // Polyglot union extraction: every `(pkg, lang)` source that was
     // unioned to build this graph, sorted by `(lang, pkg)` -- the same
     // order `build_multi_source` merges in. `pkg`/`lang` above stay the
@@ -763,6 +780,8 @@ pub struct GraphData {
 struct GraphDataWire {
     #[serde(default)]
     entry_points: BTreeMap<String, String>,
+    #[serde(default)]
+    excluded_test_files: Option<usize>,
     repo: String,
     pkg: String,
     lang: String,
@@ -827,7 +846,8 @@ impl Serialize for GraphData {
             + if self.references.is_some() { 1 } else { 0 }
             + if self.build_output_mirror != 0 { 1 } else { 0 }
             + usize::from(self.python_cross_project != 0)
-            + usize::from(!self.entry_points.is_empty());
+            + usize::from(!self.entry_points.is_empty())
+            + usize::from(self.excluded_test_files.is_some());
         let mut state = serializer.serialize_struct("GraphData", fields)?;
         state.serialize_field("repo", &self.repo)?;
         state.serialize_field("pkg", &self.pkg)?;
@@ -850,6 +870,9 @@ impl Serialize for GraphData {
         }
         if !self.entry_points.is_empty() {
             state.serialize_field("entry_points", &self.entry_points)?;
+        }
+        if let Some(count) = self.excluded_test_files {
+            state.serialize_field("excluded_test_files", &count)?;
         }
         state.end()
     }
@@ -919,6 +942,7 @@ impl<'de> Deserialize<'de> for GraphData {
             references: wire.references,
             build_output_mirror: wire.build_output_mirror,
             python_cross_project: wire.python_cross_project,
+            excluded_test_files: wire.excluded_test_files,
         })
     }
 }
@@ -998,6 +1022,7 @@ mod tests {
             references: None,
             build_output_mirror: 0,
             python_cross_project: 0,
+            excluded_test_files: None,
         };
 
         let bytes = serde_json::to_vec(&data).unwrap();
@@ -1056,6 +1081,7 @@ mod tests {
             references: None,
             build_output_mirror: 3,
             python_cross_project: 0,
+            excluded_test_files: None,
         };
 
         let value: serde_json::Value =
@@ -1091,6 +1117,7 @@ mod tests {
             references: None,
             build_output_mirror: 0,
             python_cross_project: 3,
+            excluded_test_files: None,
         };
         let value: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(&data).unwrap()).unwrap();

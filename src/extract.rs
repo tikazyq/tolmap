@@ -889,6 +889,25 @@ fn build_selected_sources(
     let graph_started = Instant::now();
     let mut graph = finish_graph(repo, merged, history, progress)?;
     graph.references = references;
+    if selected.is_none() {
+        let mut excluded = BTreeSet::new();
+        for (pkg, language) in &sorted_sources {
+            collect_source_files(
+                repo,
+                &repo.join(pkg),
+                *language,
+                &mut Vec::new(),
+                Some(&mut excluded),
+                false,
+            )?;
+        }
+        // Overlapping source roots count a path once; a file mapped by another
+        // source is not excluded from the resulting union.
+        for node in &graph.nodes {
+            excluded.remove(&node.file);
+        }
+        graph.excluded_test_files = Some(excluded.len());
+    }
     progress.log(format!("index_work {}", serde_json::json!({"files":graph.nodes.len(), "graph_edges":graph.edges.len(), "resolved_import_pairs":graph.imports.len()})));
     graph_time += graph_started.elapsed();
     let total = started.elapsed();
@@ -1969,16 +1988,20 @@ pub(crate) fn source_files(repo: &Path, pkg: &str, language: LanguageKind) -> Re
         root.display()
     );
     let mut result = Vec::new();
-    collect_source_files(repo, &root, language, &mut result)?;
+    collect_source_files(repo, &root, language, &mut result, None, false)?;
     result.sort();
     Ok(result)
 }
+
+pub const TEST_EXCLUSION_RULE: &str = "Within selected source roots: Python skips test/ and tests/; Go, Rust and TypeScript also skip __tests__/; Go skips *_test.go; TypeScript skips *.test.* and *.spec.*. Other source exclusions still apply; inline tests and Rust *_tests.rs files are included.";
 
 fn collect_source_files(
     repo: &Path,
     directory: &Path,
     language: LanguageKind,
     result: &mut Vec<String>,
+    mut excluded: Option<&mut BTreeSet<String>>,
+    in_test_dir: bool,
 ) -> Result<()> {
     let mut entries = fs::read_dir(directory)
         .with_context(|| format!("read directory {}", directory.display()))?
@@ -1996,8 +2019,17 @@ fn collect_source_files(
                 }
                 LanguageKind::Rust => rust::skip_dir(&name),
             };
-            if !skip {
-                collect_source_files(repo, &path, language, result)?;
+            let test_dir = matches!(name.as_str(), "test" | "tests")
+                || (language != LanguageKind::Python && name == "__tests__");
+            if !skip || (test_dir && excluded.is_some()) {
+                collect_source_files(
+                    repo,
+                    &path,
+                    language,
+                    result,
+                    excluded.as_deref_mut(),
+                    in_test_dir || test_dir,
+                )?;
             }
             continue;
         }
@@ -2023,7 +2055,20 @@ fn collect_source_files(
                     && !name.contains(".spec.")
             }
         };
-        if accepted {
+        let test_name = match language {
+            LanguageKind::Go => name.ends_with("_test.go"),
+            LanguageKind::TypeScript => {
+                (name.ends_with(".ts") || name.ends_with(".tsx"))
+                    && !name.ends_with(".d.ts")
+                    && (name.contains(".test.") || name.contains(".spec."))
+            }
+            _ => false,
+        };
+        if (accepted && in_test_dir) || test_name {
+            if let Some(excluded) = excluded.as_deref_mut() {
+                excluded.insert(relative_slash(repo, &path)?);
+            }
+        } else if accepted {
             result.push(relative_slash(repo, &path)?);
         }
     }
@@ -6901,6 +6946,7 @@ fn finish_graph(
         references: None,
         build_output_mirror,
         python_cross_project,
+        excluded_test_files: None,
     })
 }
 
@@ -7159,6 +7205,75 @@ pub(crate) fn round_to(value: f64, digits: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_exclusion_measurement_preserves_source_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [
+            "src/lib.rs",
+            "src/unit_tests.rs",
+            "tests/a.rs",
+            "tests/nested/b.rs",
+            "tests/vendor/ignored.rs",
+            "src/a.go",
+            "src/a_test.go",
+            "src/a.ts",
+            "src/a.test.ts",
+            "src/a.spec.tsx",
+            "src/a.test.d.ts",
+            "__tests__/b.ts",
+            "pkg/a.py",
+            "pkg/test_a.py",
+            "pkg/tests/a.py",
+            "pkg/__tests__/b.py",
+        ] {
+            write(dir.path(), path, "");
+        }
+        for (language, expected) in [
+            (LanguageKind::Rust, 2),
+            (LanguageKind::Go, 1),
+            (LanguageKind::TypeScript, 3),
+            (LanguageKind::Python, 1),
+        ] {
+            let original = source_files(dir.path(), ".", language).unwrap();
+            let mut files = Vec::new();
+            let mut excluded = BTreeSet::new();
+            collect_source_files(
+                dir.path(),
+                dir.path(),
+                language,
+                &mut files,
+                Some(&mut excluded),
+                false,
+            )
+            .unwrap();
+            files.sort();
+            assert_eq!(files, original);
+            assert_eq!(excluded.len(), expected, "{language:?}: {excluded:?}");
+        }
+    }
+
+    #[test]
+    fn overlapping_source_roots_count_excluded_tests_once_in_graph_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "pkg/a.py", "value = 1\n");
+        write(dir.path(), "pkg/tests/a.py", "assert True\n");
+        write(dir.path(), "pkg/tests/b.py", "assert True\n");
+        let graph = build_multi_source(
+            dir.path(),
+            &[
+                (".".into(), LanguageKind::Python),
+                ("pkg".into(), LanguageKind::Python),
+            ],
+        )
+        .unwrap();
+        assert_eq!(graph.excluded_test_files, Some(2));
+        assert_eq!(graph.nodes.len(), 1);
+        let json = serde_json::to_value(&graph).unwrap();
+        assert_eq!(json["excluded_test_files"], 2);
+        let restored: GraphData = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.excluded_test_files, Some(2));
+    }
 
     #[test]
     fn lockfile_change_misses_cache_with_extractor_reason() {

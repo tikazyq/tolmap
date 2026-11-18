@@ -714,6 +714,26 @@ mod tests {
     }
 }
 
+// Use the caller's linked worktree only when Git confirms it shares the
+// registered checkout's object store. An unrelated cwd never changes selection.
+fn check_checkout(registered: &Path, cwd: &Path) -> PathBuf {
+    let common = |path: &Path| -> Result<PathBuf> {
+        Ok(PathBuf::from(git(
+            path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?)
+        .canonicalize()?)
+    };
+    if let (Ok(a), Ok(b)) = (common(registered), common(cwd)) {
+        if a == b {
+            if let Ok(root) = checkout(cwd) {
+                return root;
+            }
+        }
+    }
+    registered.to_owned()
+}
+
 /// Resolve a check's base through the same registry as read-only queries.
 /// Explicit checkout + base retains the independent build/check workflow.
 #[allow(clippy::too_many_arguments)]
@@ -750,22 +770,32 @@ pub fn resolve_check(
         ));
     }
     let library = Library::open(data)?;
-    let repo = library.resolve(name)?;
-    let snapshot = library.snapshot(&repo, commit, snapshot_id)?;
+    let repo = library.resolve(name).context("check needs a registered repository in this data root; pass --data ROOT --repo NAME, or use an explicit checkout with --base REF and optionally --base-map FILE")?;
+    let snapshot = library.snapshot(&repo, commit, snapshot_id).with_context(|| {
+        format!("check needs an indexed base snapshot for {}; select a retained one with --commit SHA or --snapshot ID (use the same --data ROOT as indexing), or pass an explicit checkout with --base REF and optionally --base-map FILE", repo.name)
+    })?;
+    ensure!(snapshot.map_path.is_file(), "indexed base map {} is missing; run tolmap refresh --repo {} or pass an explicit checkout with --base REF --base-map FILE", snapshot.map_path.display(), repo.name);
     let path = if repo.kind == "local" {
         ensure!(
             Path::new(&repo.location).is_dir(),
-            "checkout {} is missing",
+            "registered checkout {} is missing; pass an explicit checkout with --base REF and optionally --base-map FILE",
             repo.location
         );
-        PathBuf::from(&repo.location)
+        check_checkout(Path::new(&repo.location), &std::env::current_dir()?)
     } else {
-        let head = head.context("remote-only check requires --head and retained source")?;
-        ensure!(snapshot.source_path.is_dir(), "snapshot source is missing");
+        let head = head.with_context(|| format!("repository {} is registered as a remote; no working-tree head was selected. Pass --head REF to compare retained source, or use `tolmap check . --base {} --base-map {}` from the worktree", repo.name, snapshot.commit, snapshot.map_path.display()))?;
+        ensure!(snapshot.source_path.is_dir(), "retained source {} is missing for {}; run tolmap refresh --repo {} or pass an explicit checkout with --base REF --base-map FILE", snapshot.source_path.display(), repo.name, repo.name);
         // check creates temporary detached worktrees from this retained bare source.
         ensure!(!head.starts_with('-'), "invalid --head");
         snapshot.source_path.clone()
     };
+    for (flag, revision) in [
+        ("base snapshot", snapshot.commit.as_str()),
+        ("--head", head.unwrap_or("HEAD")),
+    ] {
+        git(&path, &["rev-parse", "--verify", &format!("{revision}^{{commit}}")])
+            .with_context(|| format!("{flag} revision {revision:?} is unavailable in {}; pass an explicit checkout containing the revisions with --base REF and --head REF, and optionally --base-map FILE", path.display()))?;
+    }
     if let Some(base) = base {
         let resolved = git(&path, &["rev-parse", &format!("{base}^{{commit}}")])?;
         ensure!(

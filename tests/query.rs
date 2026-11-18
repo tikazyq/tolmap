@@ -37,6 +37,71 @@ fn pinned_file_symbol_and_ambiguity() {
 }
 
 #[test]
+fn missing_paths_suggest_nearest_with_stable_ties_but_symbols_still_win() {
+    let mut s = fixture("tolmap");
+    s.map.files = vec!["src/b.rs".into(), "src/a.rs".into(), "src/long.rs".into()];
+    s.map.symbols.clear();
+    let report = s.where_is("src/c.rs", 0).unwrap();
+    assert_eq!(report.total, 0);
+    assert!(!report.truncated);
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["query"]["missing_path"], true);
+    assert_eq!(
+        json["query"]["suggestions"],
+        serde_json::json!(["src/a.rs", "src/b.rs", "src/long.rs"])
+    );
+    let text = tolmap::query::text(&report);
+    assert!(text.contains("no mapped file matches \"src/c.rs\""));
+    assert!(text.contains("nearest mapped paths: src/a.rs, src/b.rs, src/long.rs"));
+    let symbol = fixture("tolmap")
+        .where_is("src/bin/generate_types.rs::main", 8)
+        .unwrap();
+    assert_eq!(symbol.total, 1);
+    assert!(matches!(
+        symbol.query,
+        Query::Where {
+            missing_path: false,
+            ..
+        }
+    ));
+    let name = s.where_is("no-such-symbol", 8).unwrap();
+    assert!(matches!(
+        name.query,
+        Query::Where {
+            missing_path: false,
+            ..
+        }
+    ));
+    s.map.files.clear();
+    let empty = s.where_is("src/c.rs", 8).unwrap();
+    assert!(
+        matches!(empty.query, Query::Where { missing_path: true, suggestions, .. } if suggestions.is_empty())
+    );
+}
+
+#[test]
+fn overview_discloses_test_exclusions_and_unknown_legacy_count() {
+    let mut s = fixture("tolmap");
+    let report = s.overview(1000);
+    let json = serde_json::to_value(&report).unwrap();
+    assert!(json["query"]["excluded_test_files"].is_null());
+    assert!(tolmap::query::text(&report).contains("excluded test files: unknown (older map)"));
+    for count in [0, 7] {
+        s.map.excluded_test_files = Some(count);
+        let report = s.overview(1000);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["query"]["excluded_test_files"], count);
+        assert!(json["query"]["test_exclusion_rule"]
+            .as_str()
+            .unwrap()
+            .contains("*_test.go"));
+        assert!(
+            tolmap::query::text(&report).contains(&format!("excluded test files: {count}; rule:"))
+        );
+    }
+}
+
+#[test]
 fn pinned_deps_match_all_edges_and_keep_total() {
     for name in ["tolmap", "flask"] {
         let s = fixture(name);

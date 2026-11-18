@@ -78,6 +78,10 @@ pub enum Query {
     Where {
         target: String,
         ambiguous: bool,
+        #[serde(default)]
+        missing_path: bool,
+        #[serde(default)]
+        suggestions: Vec<String>,
     },
     Deps {
         path: String,
@@ -89,6 +93,10 @@ pub enum Query {
         imports: usize,
         districts: usize,
         language: String,
+        #[serde(default)]
+        excluded_test_files: Option<usize>,
+        #[serde(default)]
+        test_exclusion_rule: String,
     },
     Route {
         from: String,
